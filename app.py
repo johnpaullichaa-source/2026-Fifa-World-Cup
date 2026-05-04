@@ -38,20 +38,46 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom styling — clean, World-Cup-flavoured
+# Custom styling — adapts to both light and dark Streamlit themes.
+# We use CSS variables so colours flip automatically with @media
+# (prefers-color-scheme), keeping good contrast in either mode.
 st.markdown(
     """
     <style>
-    .main { background-color: #0E1117; }
-    .stApp { background: linear-gradient(180deg, #0a1f3d 0%, #0E1117 30%); }
+    /* ---- Light mode (default) ---- */
+    :root {
+        --wc-heading: #0a1f3d;       /* deep navy — readable on white */
+        --wc-accent:  #c8102e;       /* World Cup red */
+        --wc-card-bg: rgba(10,31,61,0.04);
+        --wc-card-bd: rgba(10,31,61,0.12);
+        --wc-team-a:  #1f4e8c;       /* navy blue */
+        --wc-team-b:  #c8102e;       /* red */
+        --wc-draw:    #6b7280;       /* neutral grey */
+        --wc-bar-text:#ffffff;
+    }
+    /* ---- Dark mode override ---- */
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --wc-heading: #f5d76e;   /* warm gold on dark background */
+            --wc-accent:  #ff5470;
+            --wc-card-bg: rgba(255,255,255,0.04);
+            --wc-card-bd: rgba(255,255,255,0.10);
+            --wc-team-a:  #4a90e2;
+            --wc-team-b:  #ff5470;
+            --wc-draw:    #9ca3af;
+            --wc-bar-text:#0a1f3d;
+        }
+    }
+
+    h1, h2, h3 { color: var(--wc-heading) !important; }
+
     .metric-card {
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.08);
+        background: var(--wc-card-bg);
+        border: 1px solid var(--wc-card-bd);
         border-radius: 12px;
         padding: 16px;
     }
     .prob-bar { height: 26px; border-radius: 6px; }
-    h1, h2, h3 { color: #f5d76e; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     </style>
     """,
@@ -395,23 +421,31 @@ def likely_scoreline(grid: np.ndarray) -> tuple[int, int, float]:
 # UI helpers
 # ---------------------------------------------------------------------------
 def prob_bar(p_a: float, p_draw: float, p_b: float, team_a: str, team_b: str):
-    """Render a horizontal stacked probability bar."""
+    """Render a horizontal stacked probability bar.
+
+    Colours come from CSS variables defined at the top of the app, so the
+    bar stays high-contrast in both light and dark Streamlit themes.
+    """
     a_pct = p_a * 100
     d_pct = p_draw * 100
     b_pct = p_b * 100
     html = f"""
     <div style="display:flex;width:100%;border-radius:8px;overflow:hidden;
-                font-weight:600;color:white;height:32px;">
-      <div style="width:{a_pct}%;background:#1f77b4;display:flex;
-                  align-items:center;justify-content:center;font-size:13px;">
+                font-weight:600;color:#fff;height:32px;
+                box-shadow:0 1px 2px rgba(0,0,0,0.08);">
+      <div style="width:{a_pct}%;background:var(--wc-team-a);display:flex;
+                  align-items:center;justify-content:center;font-size:13px;
+                  white-space:nowrap;overflow:hidden;">
         {team_a} {a_pct:.1f}%
       </div>
-      <div style="width:{d_pct}%;background:#888;display:flex;
-                  align-items:center;justify-content:center;font-size:13px;">
+      <div style="width:{d_pct}%;background:var(--wc-draw);display:flex;
+                  align-items:center;justify-content:center;font-size:13px;
+                  white-space:nowrap;overflow:hidden;">
         Draw {d_pct:.1f}%
       </div>
-      <div style="width:{b_pct}%;background:#d62728;display:flex;
-                  align-items:center;justify-content:center;font-size:13px;">
+      <div style="width:{b_pct}%;background:var(--wc-team-b);display:flex;
+                  align-items:center;justify-content:center;font-size:13px;
+                  white-space:nowrap;overflow:hidden;">
         {team_b} {b_pct:.1f}%
       </div>
     </div>"""
@@ -625,10 +659,26 @@ def page_predictor(hist: pd.DataFrame, groups: pd.DataFrame):
     grid_df.columns.name = team_b
 
     st.subheader("Score-line probability grid (%)")
-    st.dataframe(
-        grid_df.style.background_gradient(cmap="YlOrRd").format("{:.2f}"),
-        use_container_width=True,
+    st.caption(
+        f"Rows = {team_a} goals, columns = {team_b} goals. "
+        "Each cell is the probability of that exact scoreline."
     )
+    try:
+        # Pretty heatmap when matplotlib is available.
+        # `Blues` reads well on both light and dark Streamlit themes
+        # (dark cells = high probability either way).
+        st.dataframe(
+            grid_df.style
+                .background_gradient(cmap="Blues")
+                .format("{:.2f}"),
+            use_container_width=True,
+        )
+    except ImportError:
+        # Fallback: plain dataframe — always works, no extra dependency
+        st.dataframe(
+            grid_df.round(2),
+            use_container_width=True,
+        )
 
     # --- Head-to-head detail ---
     h = head_to_head(hist, team_a, team_b)
