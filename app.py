@@ -5,9 +5,10 @@ Streamlit app that predicts every match in the 2026 FIFA World Cup
 (Canada / Mexico / USA) using historical World Cup data.
 
 Files expected in the same folder as app.py (or repo root):
-    - world-cup-Data-all-matches-2.csv   (historical match results, 1930-)
-    - WCup_2026_4.2.5_en.xlsx            (2026 draw / fixture file)
-    - results_2026.csv                   (optional, results as they come in)
+    - world-cup-Data-all-matches-2.csv          (historical match results, 1930-)
+    - WCup_2026_4.2.5_en.xlsx                   (2026 draw / fixture file)
+    - world_cup_2026_all_nations_qualifiers.csv (2026 qualifying campaign results)
+    - results_2026.csv                          (optional, results as they come in)
 
 The results_2026.csv has columns:
     match_no,home_team,away_team,home_score,away_score
@@ -91,6 +92,7 @@ ROOT = Path(__file__).parent
 HIST_CSV = ROOT / "world-cup-Data-all-matches-2.csv"
 DRAW_XLSX = ROOT / "WCup_2026_4.2.5_en.xlsx"
 RESULTS_CSV = ROOT / "results_2026.csv"
+QUALIFIERS_CSV = ROOT / "world_cup_2026_all_nations_qualifiers.csv"
 
 RESULTS_TEMPLATE_COLUMNS = [
     "match_no", "home_team", "away_team", "home_score", "away_score",
@@ -115,9 +117,9 @@ RESULTS_TEMPLATE_COLUMNS = [
 HISTORICAL_NAMES: dict[str, list[str]] = {
     # ---- Spelling-only renames (one-to-one) ----
     "Rep. of Korea":   ["South Korea"],
-    "USA":             ["United States"],
+    "USA":             ["USA", "United States"],
     "IR Iran":         ["Iran"],
-    "Bosnia/Herzeg.":  ["Bosnia and Herzegovina"],
+    "Bosnia/Herzeg.":  ["Bosnia and Herzegovina", "Bosnia & Herz."],
     "Ivory Coast":     ["Ivory Coast"],
     "Turkey":          ["Turkey"],          # Türkiye in some sources
     # ---- Successor-state inheritances ----
@@ -125,7 +127,7 @@ HISTORICAL_NAMES: dict[str, list[str]] = {
     "Germany":         ["Germany", "West Germany"],
     "Russia":          ["Russia", "Soviet Union"],
     "Serbia":          ["Serbia", "Serbia and Montenegro", "Yugoslavia"],
-    "DR Congo":        ["Zaire"],
+    "DR Congo":        ["DR Congo", "Zaire"],
     # ---- True debutants (kept here for completeness) ----
     "Cape Verde":      ["Cape Verde"],
     "Curaçao":         ["Curaçao"],
@@ -143,6 +145,101 @@ DEBUTANTS_2026: set[str] = {
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Qualifying-campaign data (2026 cycle)
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_qualifiers() -> pd.DataFrame:
+    """Return a tidy dataframe of 2026 qualifying matches.
+
+    The raw CSV lists each match from one team's perspective. Some matches
+    appear twice (once for each side) which we de-duplicate, then we
+    explode again into one row per team-match (long format), matching
+    the layout used by `load_history`.
+    """
+    if not QUALIFIERS_CSV.exists():
+        return pd.DataFrame(
+            columns=["team", "opponent", "gf", "ga", "result", "region"]
+        )
+
+    raw = pd.read_csv(QUALIFIERS_CSV)
+
+    # Parse "Team A vs Team B" + "x-y" into structured columns
+    parsed = raw["Match"].str.split(" vs ", n=1, expand=True)
+    raw = raw.assign(
+        home=parsed[0].str.strip(),
+        away=parsed[1].str.strip(),
+    )
+    # Strip any trailing notation like ' (4-1 pen)' or ' (aet)' — we keep
+    # the regulation-time scoreline, which is what matters for goal averages.
+    clean = raw["Scoreline"].astype(str).str.split("(").str[0].str.strip()
+    score = clean.str.split("-", n=1, expand=True)
+    raw["home_score"] = pd.to_numeric(score[0], errors="coerce")
+    raw["away_score"] = pd.to_numeric(score[1], errors="coerce")
+    raw = raw.dropna(subset=["home_score", "away_score"])
+    raw["home_score"] = raw["home_score"].astype(int)
+    raw["away_score"] = raw["away_score"].astype(int)
+
+    # Normalise spelling differences between qualifier files and the 2026 draw
+    # so qualifier_profile() lookups succeed for every team.
+    QUAL_NAME_FIXES = {
+        "Bosnia & Herz.": "Bosnia and Herzegovina",
+    }
+    for col in ["home", "away"]:
+        raw[col] = raw[col].replace(QUAL_NAME_FIXES)
+
+    # De-duplicate: a unique match is the unordered pair + scoreline
+    raw["_pair"] = raw.apply(
+        lambda r: tuple(sorted([r["home"], r["away"]])) + (r["home_score"], r["away_score"]),
+        axis=1,
+    )
+    unique = raw.drop_duplicates(subset=["_pair"]).copy()
+
+    # Long format: two rows per match (one for each team)
+    home_rows = pd.DataFrame({
+        "team":     unique["home"],
+        "opponent": unique["away"],
+        "gf":       unique["home_score"],
+        "ga":       unique["away_score"],
+        "region":   unique["Region"],
+    })
+    away_rows = pd.DataFrame({
+        "team":     unique["away"],
+        "opponent": unique["home"],
+        "gf":       unique["away_score"],
+        "ga":       unique["home_score"],
+        "region":   unique["Region"],
+    })
+    tidy = pd.concat([home_rows, away_rows], ignore_index=True)
+    tidy["result"] = np.select(
+        [tidy["gf"] > tidy["ga"], tidy["gf"] < tidy["ga"]],
+        ["W", "L"],
+        default="D",
+    )
+    return tidy
+
+
+def qualifier_profile(qual: pd.DataFrame, team: str) -> dict | None:
+    """Return {matches, avg_gf, avg_ga} for a team in qualifying, or None.
+
+    Looks up under every name the team has played under (so e.g.
+    'Rep. of Korea' resolves to 'South Korea' in the qualifying CSV).
+    """
+    names = hist_names(team)
+    df = qual[qual["team"].isin(names)]
+    if df.empty:
+        return None
+    return {
+        "matches": int(len(df)),
+        "avg_gf": float(df["gf"].mean()),
+        "avg_ga": float(df["ga"].mean()),
+        "wins":   int((df["result"] == "W").sum()),
+        "draws":  int((df["result"] == "D").sum()),
+        "losses": int((df["result"] == "L").sum()),
+        "games":  df.sort_index().reset_index(drop=True),
+    }
+
+
 @st.cache_data(show_spinner=False)
 def load_history() -> pd.DataFrame:
     """Return tidy historical match dataframe with one row per team-match.
@@ -399,47 +496,112 @@ def baseline_goals(hist: pd.DataFrame) -> tuple[float, float]:
     return float(hist["gf"].mean()), float(hist["ga"].mean())
 
 
+def _team_attack_defense(
+    hist: pd.DataFrame,
+    qual: pd.DataFrame | None,
+    team: str,
+    base_gf: float,
+    base_ga: float,
+    qualifier_weight: float,
+    debutant_strength: float,
+) -> tuple[float, float, dict]:
+    """Compute (attack, defense, flags) for a single team.
+
+    Combines World-Cup history with 2026 qualifying form using a
+    weighted blend. Falls back to baseline for true debutants.
+    """
+    flags = {"is_debutant": False, "used_qualifiers": False}
+
+    # ---- World Cup history component ----
+    h = team_history(hist, team)
+    if h.empty:
+        wc_attack = base_gf * debutant_strength
+        wc_defense = base_ga / debutant_strength
+        flags["is_debutant"] = True
+    else:
+        wc_attack = float(h["gf"].mean())
+        wc_defense = float(h["ga"].mean())
+
+    # ---- 2026 qualifying component ----
+    if qual is not None and not qual.empty and qualifier_weight > 0:
+        prof = qualifier_profile(qual, team)
+    else:
+        prof = None
+
+    if prof is None:
+        return wc_attack, wc_defense, flags
+
+    flags["used_qualifiers"] = True
+    flags["qualifier_matches"] = prof["matches"]
+
+    # Effective weight scales with the size of the qualifying sample.
+    # A team with 1 qualifier match shouldn't outweigh decades of WC data.
+    # k=4: with 4 qualifiers, full `qualifier_weight` applies; less below.
+    k = 4
+    sample_factor = prof["matches"] / (prof["matches"] + k)
+    w = qualifier_weight * sample_factor
+
+    # Debutants — the qualifying sample is the *only* real signal we have,
+    # so override the baseline fallback entirely with their qualifier form
+    # (still using sample_factor so a single match doesn't fully dominate).
+    if flags["is_debutant"]:
+        # Blend qualifying form with baseline by sample size
+        attack = (
+            sample_factor * prof["avg_gf"]
+            + (1 - sample_factor) * (base_gf * debutant_strength)
+        )
+        defense = (
+            sample_factor * prof["avg_ga"]
+            + (1 - sample_factor) * (base_ga / debutant_strength)
+        )
+        return attack, defense, flags
+
+    # Established team — weighted average of WC history and qualifying form
+    attack = (1 - w) * wc_attack + w * prof["avg_gf"]
+    defense = (1 - w) * wc_defense + w * prof["avg_ga"]
+    return attack, defense, flags
+
+
 def expected_goals(
     hist: pd.DataFrame,
     team_a: str,
     team_b: str,
     h2h_weight: float = 0.30,
     debutant_strength: float = 0.85,
+    qual: pd.DataFrame | None = None,
+    qualifier_weight: float = 0.35,
 ) -> tuple[float, float, dict]:
     """Return (lambda_a, lambda_b, info) — expected goals for each team.
 
     Method:
       1. Start from each team's historical attack (avg goals scored)
          and defense (avg goals conceded) at the World Cup.
-      2. Combine them: team A's expected goals = mean(A.attack, B.defense).
-      3. If the two teams have met at past World Cups, blend the
+      2. Blend in their 2026 qualifying form, weighted by sample size
+         (more qualifying matches = more influence; capped by
+         `qualifier_weight`).
+      3. Combine teams: team A's xG = mean(A.attack, B.defense).
+      4. If the two teams have met at past World Cups, blend the
          head-to-head goal averages in (weight = h2h_weight).
-      4. For debutants (no history), fall back to the tournament-wide
-         baseline scaled by `debutant_strength` (a slight penalty
-         reflecting the difficulty of a first World Cup).
+      5. For debutants with no history *and* no qualifier data, fall
+         back to the tournament-wide baseline scaled by
+         `debutant_strength`.
     """
     base_gf, base_ga = baseline_goals(hist)
-    info: dict = {"debutant_a": False, "debutant_b": False}
+    info: dict = {"debutant_a": False, "debutant_b": False,
+                  "used_qualifiers_a": False, "used_qualifiers_b": False}
 
-    # --- team A profile (uses every predecessor name) ---
-    a_hist = team_history(hist, team_a)
-    if a_hist.empty:
-        info["debutant_a"] = True
-        a_attack = base_gf * debutant_strength
-        a_defense = base_ga / debutant_strength  # leakier defense
-    else:
-        a_attack = a_hist["gf"].mean()
-        a_defense = a_hist["ga"].mean()
-
-    # --- team B profile ---
-    b_hist = team_history(hist, team_b)
-    if b_hist.empty:
-        info["debutant_b"] = True
-        b_attack = base_gf * debutant_strength
-        b_defense = base_ga / debutant_strength
-    else:
-        b_attack = b_hist["gf"].mean()
-        b_defense = b_hist["ga"].mean()
+    a_attack, a_defense, fa = _team_attack_defense(
+        hist, qual, team_a, base_gf, base_ga, qualifier_weight, debutant_strength,
+    )
+    b_attack, b_defense, fb = _team_attack_defense(
+        hist, qual, team_b, base_gf, base_ga, qualifier_weight, debutant_strength,
+    )
+    info["debutant_a"] = fa["is_debutant"]
+    info["debutant_b"] = fb["is_debutant"]
+    info["used_qualifiers_a"] = fa["used_qualifiers"]
+    info["used_qualifiers_b"] = fb["used_qualifiers"]
+    info["qualifier_matches_a"] = fa.get("qualifier_matches", 0)
+    info["qualifier_matches_b"] = fb.get("qualifier_matches", 0)
 
     # Blend attack vs opponent defense (each scaled by tournament average)
     lam_a = (a_attack + b_defense) / 2
@@ -511,9 +673,17 @@ def prob_bar(p_a: float, p_draw: float, p_b: float, team_a: str, team_b: str):
     st.markdown(html, unsafe_allow_html=True)
 
 
-def predict_card(hist: pd.DataFrame, team_a: str, team_b: str):
+def predict_card(
+    hist: pd.DataFrame,
+    team_a: str,
+    team_b: str,
+    qual: pd.DataFrame | None = None,
+    qualifier_weight: float = 0.35,
+):
     """Render a full prediction card for one match."""
-    lam_a, lam_b, info = expected_goals(hist, team_a, team_b)
+    lam_a, lam_b, info = expected_goals(
+        hist, team_a, team_b, qual=qual, qualifier_weight=qualifier_weight,
+    )
     p_a, p_d, p_b, grid = match_probabilities(lam_a, lam_b)
     sa, sb, p_score = likely_scoreline(grid)
 
@@ -526,9 +696,35 @@ def predict_card(hist: pd.DataFrame, team_a: str, team_b: str):
 
     flags = []
     if info.get("debutant_a"):
-        flags.append(f"⚠️ {team_a} is a World Cup debutant — using baseline projection.")
+        if info.get("used_qualifiers_a"):
+            flags.append(
+                f"🆕 {team_a} is a World Cup debutant — projection based on "
+                f"{info['qualifier_matches_a']} qualifying match(es)."
+            )
+        else:
+            flags.append(
+                f"⚠️ {team_a} is a World Cup debutant — using baseline projection."
+            )
+    elif info.get("used_qualifiers_a"):
+        flags.append(
+            f"📈 {team_a}: {info['qualifier_matches_a']} qualifying match(es) "
+            "blended into projection."
+        )
     if info.get("debutant_b"):
-        flags.append(f"⚠️ {team_b} is a World Cup debutant — using baseline projection.")
+        if info.get("used_qualifiers_b"):
+            flags.append(
+                f"🆕 {team_b} is a World Cup debutant — projection based on "
+                f"{info['qualifier_matches_b']} qualifying match(es)."
+            )
+        else:
+            flags.append(
+                f"⚠️ {team_b} is a World Cup debutant — using baseline projection."
+            )
+    elif info.get("used_qualifiers_b"):
+        flags.append(
+            f"📈 {team_b}: {info['qualifier_matches_b']} qualifying match(es) "
+            "blended into projection."
+        )
     if info["h2h"]["played"] == 0:
         flags.append("ℹ️ No prior World Cup meetings between these teams.")
     else:
@@ -555,6 +751,7 @@ def main() -> None:
 
     base_hist = load_history()
     groups, fixtures = load_draw()
+    qualifiers = load_qualifiers()
 
     # --- Sidebar nav ---
     st.sidebar.title("⚽ World Cup 2026")
@@ -566,6 +763,25 @@ def main() -> None:
     )
 
     st.sidebar.divider()
+    st.sidebar.markdown("### ⚙️ Model settings")
+    use_qualifiers = st.sidebar.toggle(
+        "Blend in 2026 qualifying form",
+        value=True,
+        help="When on, each team's 2026 qualifying-campaign results are "
+             "blended with their World Cup history. Especially helpful for "
+             "debutants who have no World Cup data.",
+    )
+    qualifier_weight = st.sidebar.slider(
+        "Qualifier weight",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.35,
+        step=0.05,
+        help="Maximum influence qualifying form can have (the actual weight "
+             "also scales with sample size).",
+        disabled=not use_qualifiers,
+    )
+
     st.sidebar.markdown("### 📡 2026 results feed")
     uploaded = st.sidebar.file_uploader(
         "Upload results CSV",
@@ -585,25 +801,30 @@ def main() -> None:
     hist = merge_results_into_history(base_hist, results) if use_live else base_hist
     stats = team_stats(hist)
 
+    # Stash settings in a single object passed down to predict_card etc.
+    qual_in_use = qualifiers if use_qualifiers else None
+    qual_w = qualifier_weight if use_qualifiers else 0.0
+
     st.sidebar.divider()
     st.sidebar.metric("Historical matches", f"{len(base_hist)//2:,}")
     st.sidebar.metric("Teams in history", f"{base_hist['team'].nunique()}")
+    st.sidebar.metric("Qualifier matches", f"{len(qualifiers)//2 if not qualifiers.empty else 0}")
     st.sidebar.metric("2026 results loaded", f"{len(results)}")
     st.sidebar.metric("2026 fixtures", f"{len(fixtures)}")
 
     # --- Pages ---
     if page == "🏟️ Dashboard":
-        page_dashboard(hist, groups, fixtures, results)
+        page_dashboard(hist, groups, fixtures, results, qual_in_use, qual_w)
     elif page == "🔮 Match Predictor":
-        page_predictor(hist, groups)
+        page_predictor(hist, groups, qual_in_use, qual_w)
     elif page == "👥 Team Profiles":
-        page_profiles(hist, stats, groups)
+        page_profiles(hist, stats, groups, qualifiers)
     elif page == "🥇 Tournament Simulator":
-        page_simulator(hist, fixtures, groups, results)
+        page_simulator(hist, fixtures, groups, results, qual_in_use, qual_w)
     elif page == "📡 Live Results":
-        page_live_results(base_hist, fixtures, results)
+        page_live_results(base_hist, fixtures, results, qual_in_use, qual_w)
     else:
-        page_methodology(hist)
+        page_methodology(hist, qualifiers)
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +835,8 @@ def page_dashboard(
     groups: pd.DataFrame,
     fixtures: pd.DataFrame,
     results: pd.DataFrame,
+    qual: pd.DataFrame | None,
+    qualifier_weight: float,
 ):
     st.title("🏟️ World Cup 2026 — Fixture Dashboard")
     st.caption("Browse every scheduled match. Predictions appear automatically "
@@ -681,13 +904,18 @@ def page_dashboard(
                     st.success(
                         f"✅ **Played:** {m['team1']} {a_h} – {a_a} {m['team2']}"
                     )
-                predict_card(hist, m["team1"], m["team2"])
+                predict_card(hist, m["team1"], m["team2"], qual, qualifier_weight)
 
 
 # ---------------------------------------------------------------------------
 # Page: Match Predictor — pick any two teams
 # ---------------------------------------------------------------------------
-def page_predictor(hist: pd.DataFrame, groups: pd.DataFrame):
+def page_predictor(
+    hist: pd.DataFrame,
+    groups: pd.DataFrame,
+    qual: pd.DataFrame | None,
+    qualifier_weight: float,
+):
     st.title("🔮 Match Predictor")
     st.caption("Pick any two 2026 teams to see win/draw/loss probabilities, "
                "expected goals and head-to-head history.")
@@ -704,10 +932,12 @@ def page_predictor(hist: pd.DataFrame, groups: pd.DataFrame):
         return
 
     st.divider()
-    predict_card(hist, team_a, team_b)
+    predict_card(hist, team_a, team_b, qual, qualifier_weight)
 
     # --- Score-grid heatmap ---
-    lam_a, lam_b, _ = expected_goals(hist, team_a, team_b)
+    lam_a, lam_b, _ = expected_goals(
+        hist, team_a, team_b, qual=qual, qualifier_weight=qualifier_weight,
+    )
     _, _, _, grid = match_probabilities(lam_a, lam_b, max_goals=6)
     grid_df = pd.DataFrame(
         (grid * 100).round(2),
@@ -762,7 +992,12 @@ def page_predictor(hist: pd.DataFrame, groups: pd.DataFrame):
 # ---------------------------------------------------------------------------
 # Page: Team Profiles
 # ---------------------------------------------------------------------------
-def page_profiles(hist: pd.DataFrame, stats: pd.DataFrame, groups: pd.DataFrame):
+def page_profiles(
+    hist: pd.DataFrame,
+    stats: pd.DataFrame,
+    groups: pd.DataFrame,
+    qualifiers: pd.DataFrame,
+):
     st.title("👥 Team Profiles — 2026 Squads")
 
     teams_2026 = sorted(groups["team"].dropna().unique().tolist())
@@ -771,12 +1006,25 @@ def page_profiles(hist: pd.DataFrame, stats: pd.DataFrame, groups: pd.DataFrame)
     g_row = groups[groups["team"] == team].iloc[0]
     st.markdown(f"### {team}  ·  Group **{g_row['group']}**")
 
+    # Always render the qualifying-form section (works for debutants too)
+    qprof = qualifier_profile(qualifiers, team) if not qualifiers.empty else None
+
     if is_debutant(team, hist):
-        st.warning(
-            f"🆕 **{team} are making their FIFA World Cup debut in 2026.** "
-            "There is no historical World Cup data, so all projections fall "
-            "back to the tournament-wide baseline (see Methodology page)."
-        )
+        if qprof:
+            st.warning(
+                f"🆕 **{team} are making their FIFA World Cup debut in 2026.** "
+                f"No historical World Cup data, but their **{qprof['matches']} "
+                "qualifying matches** (shown below) are used in projections."
+            )
+        else:
+            st.warning(
+                f"🆕 **{team} are making their FIFA World Cup debut in 2026.** "
+                "There is no historical World Cup data and no qualifying "
+                "data found, so all projections fall back to the tournament-wide "
+                "baseline (see Methodology page)."
+            )
+        if qprof:
+            _render_qualifier_section(team, qprof)
         return
 
     s = stats[stats["team"] == team]
@@ -813,6 +1061,26 @@ def page_profiles(hist: pd.DataFrame, stats: pd.DataFrame, groups: pd.DataFrame)
     )
     st.line_chart(timeline.set_index("year"))
 
+    if qprof:
+        _render_qualifier_section(team, qprof)
+
+
+def _render_qualifier_section(team: str, qprof: dict):
+    """Render the 2026-qualifying form block on a team profile."""
+    st.subheader("🗒️ 2026 qualifying form")
+    n = qprof["matches"]
+    c = st.columns(4)
+    c[0].metric("Matches in dataset", n)
+    c[1].metric("Record",
+                f"{qprof['wins']}W / {qprof['draws']}D / {qprof['losses']}L")
+    c[2].metric("Avg goals scored", f"{qprof['avg_gf']:.2f}")
+    c[3].metric("Avg goals conceded", f"{qprof['avg_ga']:.2f}")
+    games = qprof["games"][["team", "opponent", "gf", "ga", "result", "region"]]
+    games = games.rename(columns={
+        "team": "played as", "gf": "scored", "ga": "conceded",
+    })
+    st.dataframe(games, use_container_width=True, hide_index=True)
+
 
 # ---------------------------------------------------------------------------
 # Page: Tournament Simulator — run the group stage
@@ -822,6 +1090,8 @@ def page_simulator(
     fixtures: pd.DataFrame,
     groups: pd.DataFrame,
     results: pd.DataFrame,
+    qual: pd.DataFrame | None,
+    qualifier_weight: float,
 ):
     st.title("🥇 Group-Stage Simulator")
     st.caption("Plays out every group-stage match. Completed matches use the "
@@ -863,7 +1133,9 @@ def page_simulator(
             table_rows.append({"team": a, "xPts": pts_a, "xGF": ga, "xGA": gb})
             table_rows.append({"team": b, "xPts": pts_b, "xGF": gb, "xGA": ga})
         else:
-            lam_a, lam_b, _ = expected_goals(hist, a, b)
+            lam_a, lam_b, _ = expected_goals(
+                hist, a, b, qual=qual, qualifier_weight=qualifier_weight,
+            )
             p_a, p_d, p_b, _ = match_probabilities(lam_a, lam_b)
             # Expected points: P(W)*3 + P(D)*1
             table_rows.append({"team": a, "xPts": p_a * 3 + p_d, "xGF": lam_a, "xGA": lam_b})
@@ -899,6 +1171,8 @@ def page_live_results(
     base_hist: pd.DataFrame,
     fixtures: pd.DataFrame,
     results: pd.DataFrame,
+    qual: pd.DataFrame | None,
+    qualifier_weight: float,
 ):
     st.title("📡 Live 2026 Results")
     st.caption("Track results as they come in and see how the model is doing.")
@@ -943,7 +1217,9 @@ def page_live_results(
         h, a = r["home_team"], r["away_team"]
         hg, ag = int(r["home_score"]), int(r["away_score"])
         # Predict using the *base* history (no leakage — predict pre-tournament)
-        lam_a, lam_b, _ = expected_goals(base_hist, h, a)
+        lam_a, lam_b, _ = expected_goals(
+            base_hist, h, a, qual=qual, qualifier_weight=qualifier_weight,
+        )
         p_a, p_d, p_b, grid = match_probabilities(lam_a, lam_b)
         sa, sb, _ = likely_scoreline(grid)
         actual_outcome = "H" if hg > ag else ("A" if hg < ag else "D")
@@ -992,10 +1268,11 @@ def page_live_results(
 # ---------------------------------------------------------------------------
 # Page: Methodology
 # ---------------------------------------------------------------------------
-def page_methodology(hist: pd.DataFrame):
+def page_methodology(hist: pd.DataFrame, qualifiers: pd.DataFrame):
     st.title("📐 Methodology & Notes")
 
     base_gf, base_ga = baseline_goals(hist)
+    n_qual = len(qualifiers) // 2 if not qualifiers.empty else 0
     st.markdown(
         f"""
 ### How predictions are made
@@ -1010,6 +1287,14 @@ scored and conceded across every World Cup match in the dataset
 **Step 2 — Expected goals (xG).** For team A vs team B,
 expected goals for A is the average of A's *attack rate* and B's
 *defense rate*. This balances who scores often against who concedes often.
+
+**Step 2b — 2026 qualifying form blend.** Each team's average goals
+scored / conceded during 2026 qualifying ({n_qual} qualifying matches
+in the dataset) are blended into their attack and defense ratings.
+The weight scales with the number of qualifying matches a team has —
+teams with more qualifying data get a stronger blend (capped at the
+*Qualifier weight* slider value, default 35%). Use the sidebar toggle
+to turn this off entirely.
 
 **Step 3 — Head-to-head adjustment.** If the two teams have met at a
 previous World Cup, blend the historical head-to-head goal averages
@@ -1052,10 +1337,17 @@ Some 2026 sides have *no* prior World Cup data under any name
 Possible strategies — current implementation uses **option 1**, but
 you can swap in others by editing `expected_goals()` in `app.py`:
 
-1. **Tournament-baseline fallback (default).** Use the all-time average
-   goals-scored / goals-conceded, scaled by `debutant_strength`
-   (default 0.85, a small penalty since first-timers historically
-   underperform). Simple, no extra data required.
+1. **2026 qualifying form (current default when data is present).**
+   Use the team's average goals scored and conceded during 2026
+   qualifying. Best signal we have for first-timers — it's recent and
+   reflects the actual squad. Sample size is small (1–3 matches per
+   debutant in the dataset), so it's blended toward the tournament
+   baseline using `sample_factor = n / (n + 4)`.
+
+0. **Tournament-baseline fallback.** Used only when no qualifying
+   data exists for a team. Average goals-scored / goals-conceded
+   across all World Cup matches, scaled by `debutant_strength`
+   (default 0.85).
 
 2. **FIFA-ranking-based prior.** Pull the team's current FIFA Coca-Cola
    ranking and map it to an attack/defense rating using a logistic
@@ -1072,7 +1364,8 @@ you can swap in others by editing `expected_goals()` in `app.py`:
 5. **Bayesian shrinkage.** Start every team — debutant or not — at the
    tournament baseline and shrink toward their own average proportional
    to `matches_played / (matches_played + k)`. Avoids the binary
-   debutant/veteran cliff.
+   debutant/veteran cliff. (The current qualifier blend already does
+   something similar with sample-size weighting.)
 
 ### Limitations
 

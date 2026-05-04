@@ -1,0 +1,179 @@
+Nation,Region,Match,Scoreline,Result
+Argentina,CONMEBOL,Argentina vs Ecuador,1-0,W
+Argentina,CONMEBOL,Bolivia vs Argentina,0-3,W
+Argentina,CONMEBOL,Argentina vs Paraguay,1-0,W
+Argentina,CONMEBOL,Peru vs Argentina,0-2,W
+Argentina,CONMEBOL,Argentina vs Uruguay,0-2,L
+Argentina,CONMEBOL,Brazil vs Argentina,0-1,W
+Argentina,CONMEBOL,Argentina vs Chile,1-0,W
+Argentina,CONMEBOL,Colombia vs Argentina,2-1,L
+Argentina,CONMEBOL,Chile vs Argentina,0-1,W
+Brazil,CONMEBOL,Brazil vs Bolivia,5-1,W
+Brazil,CONMEBOL,Peru vs Brazil,0-1,W
+Brazil,CONMEBOL,Brazil vs Venezuela,1-1,D
+Brazil,CONMEBOL,Uruguay vs Brazil,2-0,L
+Brazil,CONMEBOL,Colombia vs Brazil,2-1,L
+Brazil,CONMEBOL,Brazil vs Argentina,0-1,L
+Brazil,CONMEBOL,Ecuador vs Brazil,0-0,D
+Uruguay,CONMEBOL,Uruguay vs Chile,3-1,W
+Uruguay,CONMEBOL,Ecuador vs Uruguay,2-1,L
+Uruguay,CONMEBOL,Colombia vs Uruguay,2-2,D
+Uruguay,CONMEBOL,Uruguay vs Brazil,2-0,W
+Uruguay,CONMEBOL,Argentina vs Uruguay,0-2,W
+Uruguay,CONMEBOL,Uruguay vs Bolivia,3-0,W
+Uruguay,CONMEBOL,Paraguay vs Uruguay,2-0,L
+Colombia,CONMEBOL,Colombia vs Venezuela,1-0,W
+Colombia,CONMEBOL,Chile vs Colombia,0-0,D
+Colombia,CONMEBOL,Colombia vs Uruguay,2-2,D
+Colombia,CONMEBOL,Ecuador vs Colombia,0-0,D
+Colombia,CONMEBOL,Colombia vs Brazil,2-1,W
+Colombia,CONMEBOL,Paraguay vs Colombia,0-1,W
+Ecuador,CONMEBOL,Argentina vs Ecuador,1-0,L
+Ecuador,CONMEBOL,Ecuador vs Uruguay,2-1,W
+Ecuador,CONMEBOL,Bolivia vs Ecuador,1-2,W
+Ecuador,CONMEBOL,Ecuador vs Colombia,0-0,D
+Ecuador,CONMEBOL,Ecuador vs Chile,1-0,W
+Ecuador,CONMEBOL,Ecuador vs Brazil,0-0,D
+Paraguay,CONMEBOL,Paraguay vs Uruguay,2-0,W
+Paraguay,CONMEBOL,Paraguay vs Bolivia,1-0,W
+Chile,CONMEBOL,Chile vs Argentina,0-1,L
+Bolivia,CONMEBOL,Bolivia vs Argentina,0-3,L
+Venezuela,CONMEBOL,Colombia vs Venezuela,1-0,L
+Japan,AFC,Japan vs China,7-0,W
+Japan,AFC,Bahrain vs Japan,0-5,W
+Japan,AFC,Saudi Arabia vs Japan,0-2,W
+Japan,AFC,Japan vs Australia,1-1,D
+Japan,AFC,Japan vs Myanmar,5-0,W
+Japan,AFC,Syria vs Japan,0-5,W
+Japan,AFC,Japan vs North Korea,1-0,W
+South Korea,AFC,South Korea vs Palestine,0-0,D
+South Korea,AFC,Oman vs South Korea,1-3,W
+South Korea,AFC,South Korea vs Iraq,3-2,W
+South Korea,AFC,South Korea vs Singapore,5-0,W
+South Korea,AFC,China vs South Korea,0-3,W
+South Korea,AFC,South Korea vs Thailand,1-1,D
+Australia,AFC,Australia vs Bahrain,0-1,L
+Australia,AFC,Indonesia vs Australia,0-0,D
+Australia,AFC,Australia vs China,3-1,W
+Australia,AFC,Japan vs Australia,1-1,D
+Australia,AFC,Australia vs Bangladesh,7-0,W
+Iran,AFC,Iran vs Kyrgyzstan,1-0,W
+Iran,AFC,UAE vs Iran,0-1,W
+Iran,AFC,Iran vs Qatar,4-1,W
+Iran,AFC,Uzbekistan vs Iran,2-2,D
+Uzbekistan,AFC,Uzbekistan vs Iran,2-2,D
+Uzbekistan,AFC,Uzbekistan vs UAE,1-0,W
+Uzbekistan,AFC,North Korea vs Uzbekistan,2-3,W
+Qatar,AFC,Iran vs Qatar,4-1,L
+Qatar,AFC,Qatar vs UAE,2-1,W
+Qatar,AFC,Qatar vs Kuwait,3-0,W
+Jordan,AFC,Jordan vs Oman,3-0,W
+Jordan,AFC,Jordan vs South Korea,1-1,D
+Jordan,AFC,Kuwait vs Jordan,1-2,W
+Iraq,AFC,Iraq vs Jordan,1-0,W
+Saudi Arabia,AFC,Saudi Arabia vs Indonesia,1-1,D
+Egypt,CAF,Egypt vs Djibouti,6-0,W
+Egypt,CAF,Sierra Leone vs Egypt,0-2,W
+Egypt,CAF,Egypt vs Burkina Faso,2-1,W
+Egypt,CAF,Guinea-Bissau vs Egypt,1-1,D
+Morocco,CAF,Tanzania vs Morocco,0-2,W
+Morocco,CAF,Morocco vs Zambia,2-1,W
+Morocco,CAF,Congo vs Morocco,0-6,W
+Senegal,CAF,Senegal vs South Sudan,4-0,W
+Senegal,CAF,Togo vs Senegal,0-0,D
+Senegal,CAF,Senegal vs DR Congo,1-1,D
+Senegal,CAF,Mauritania vs Senegal,0-1,W
+DR Congo,CAF,DR Congo vs Mauritania,2-0,W
+DR Congo,CAF,Senegal vs DR Congo,1-1,D
+South Africa,CAF,South Africa vs Benin,2-1,W
+South Africa,CAF,South Africa vs Zimbabwe,3-1,W
+Nigeria,CAF,Nigeria vs Zimbabwe,1-1,D
+Algeria,CAF,Algeria vs Mozambique,5-1,W
+Ivory Coast,CAF,Ivory Coast vs Seychelles,9-0,W
+Ivory Coast,CAF,Gambia vs Ivory Coast,0-2,W
+Burundi,CAF,Burundi vs Seychelles,5-0,W
+England,UEFA,England vs Serbia,2-0,W
+England,UEFA,Latvia vs England,0-5,W
+England,UEFA,Albania vs England,0-2,W
+England,UEFA,England vs Italy,3-1,W
+France,UEFA,France vs Azerbaijan,3-0,W
+France,UEFA,Iceland vs France,2-2,D
+France,UEFA,France vs Gibraltar,14-0,W
+France,UEFA,Azerbaijan vs France,1-3,W
+Portugal,UEFA,Portugal vs Armenia,9-1,W
+Portugal,UEFA,Portugal vs Hungary,2-2,D
+Portugal,UEFA,Ireland vs Portugal,0-1,W
+Germany,UEFA,Germany vs Slovakia,6-0,W
+Germany,UEFA,Germany vs Luxembourg,4-0,W
+Germany,UEFA,Luxembourg vs Germany,0-2,W
+Spain,UEFA,Spain vs Bulgaria,4-0,W
+Spain,UEFA,Georgia vs Spain,0-4,W
+Spain,UEFA,Spain vs Turkey,2-2,D
+Italy,UEFA,Italy vs Norway,1-4,L
+Italy,UEFA,England vs Italy,3-1,L
+Scotland,UEFA,Scotland vs Denmark,4-2,W
+Belgium,UEFA,Belgium vs Liechtenstein,7-0,W
+Norway,UEFA,Italy vs Norway,1-4,W
+Austria,UEFA,Austria vs San Marino,10-0,W
+Netherlands,UEFA,Netherlands vs Lithuania,4-0,W
+Panama,CONCACAF,Panama vs Guyana,3-0,W
+Panama,CONCACAF,Panama vs Belize,2-0,W
+Panama,CONCACAF,Panama vs Costa Rica,1-0,W
+Haiti,CONCACAF,Haiti vs Saint Lucia,3-1,W
+Haiti,CONCACAF,Barbados vs Haiti,1-2,W
+Curaçao,CONCACAF,Curaçao vs Barbados,2-0,W
+Curaçao,CONCACAF,Haiti vs Curaçao,1-0,L
+Jamaica,CONCACAF,Jamaica vs Dominican Republic,1-0,W
+New Zealand,OFC,New Zealand vs Fiji,7-0,W
+New Zealand,OFC,New Caledonia vs New Zealand,0-3,W
+New Caledonia,OFC,New Caledonia vs Tahiti,3-0,W
+Bosnia & Herz.,UEFA,Bosnia & Herz. vs Italy,1-1 (4-1 pen),W
+Bosnia & Herz.,UEFA,Austria vs Bosnia & Herz.,1-2,W
+Cape Verde,CAF,Cape Verde vs Angola,1-0,W
+Cape Verde,CAF,Cape Verde vs Mauritius,1-0,W
+Cape Verde,CAF,Cape Verde vs Cameroon,0-0,D
+Croatia,UEFA,Croatia vs Armenia,3-0,W
+Croatia,UEFA,Latvia vs Croatia,0-2,W
+Croatia,UEFA,Croatia vs Wales,1-1,D
+Czech Republic,UEFA,Czech Republic vs Denmark,2-2 (3-1 pen),W
+Czech Republic,UEFA,Czech Republic vs Poland,3-1,W
+DR Congo,CAF,DR Congo vs Mauritania,2-0,W
+DR Congo,CAF,Senegal vs DR Congo,1-1,D
+DR Congo,CAF,DR Congo vs Sudan,1-0,W
+Ghana,CAF,Ghana vs Madagascar,1-0,W
+Ghana,CAF,Ghana vs Central African Rep.,2-1,W
+Ghana,CAF,Comoros vs Ghana,1-0,L
+Sweden,UEFA,Sweden vs Poland,3-2,W
+Sweden,UEFA,Sweden vs Estonia,5-0,W
+Sweden,UEFA,Azerbaijan vs Sweden,0-2,W
+Switzerland,UEFA,Switzerland vs Kosovo,1-1,D
+Switzerland,UEFA,Switzerland vs Andorra,3-0,W
+Switzerland,UEFA,Israel vs Switzerland,1-1,D
+Tunisia,CAF,Tunisia vs Malawi,1-0,W
+Tunisia,CAF,Tunisia vs Sao Tome,4-0,W
+Tunisia,CAF,Equatorial Guinea vs Tunisia,1-0,L
+Argentina,CONMEBOL,Argentina vs Ecuador,1-0,W
+Argentina,CONMEBOL,Brazil vs Argentina,0-1,W
+Argentina,CONMEBOL,Argentina vs Uruguay,0-2,L
+Brazil,CONMEBOL,Brazil vs Bolivia,5-1,W
+Brazil,CONMEBOL,Uruguay vs Brazil,2-0,L
+Uruguay,CONMEBOL,Argentina vs Uruguay,0-2,W
+Colombia,CONMEBOL,Colombia vs Brazil,2-1,W
+Japan,AFC,Japan vs China,7-0,W
+Japan,AFC,Saudi Arabia vs Japan,0-2,W
+South Korea,AFC,South Korea vs Iraq,3-2,W
+Australia,AFC,Australia vs China,3-1,W
+Iran,AFC,Iran vs Qatar,4-1,W
+France,UEFA,France vs Gibraltar,14-0,W
+France,UEFA,France vs Netherlands,4-0,W
+England,UEFA,England vs Italy,3-1,W
+Portugal,UEFA,Portugal vs Luxembourg,9-0,W
+Spain,UEFA,Georgia vs Spain,1-7,W
+Egypt,CAF,Egypt vs Djibouti,6-0,W
+Morocco,CAF,Congo vs Morocco,0-6,W
+Ivory Coast,CAF,Ivory Coast vs Seychelles,9-0,W
+USA,CONCACAF,USA vs Bolivia,2-0,W
+Mexico,CONCACAF,Mexico vs Jamaica,1-0,W
+Canada,CONCACAF,Canada vs Peru,1-0,W
+Panama,CONCACAF,Panama vs Guyana,3-0,W
+New Zealand,OFC,New Zealand vs Fiji,7-0,W
