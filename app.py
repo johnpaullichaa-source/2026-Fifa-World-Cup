@@ -96,29 +96,48 @@ RESULTS_TEMPLATE_COLUMNS = [
     "match_no", "home_team", "away_team", "home_score", "away_score",
 ]
 
-# Some country names differ between the historical CSV and the 2026 draw
-# file — map the 2026-draw spelling to the historical spelling so the
-# lookups line up cleanly.
-NAME_ALIASES: dict[str, str] = {
-    "Rep. of Korea": "Korea Republic",
-    "South Korea": "Korea Republic",
-    "Czech Rep.": "Czechoslovakia",  # closest historical predecessor
-    "Bosnia/Herzeg.": "Bosnia and Herzegovina",
-    "USA": "United States",
-    "IR Iran": "Iran",
-    "Ivory Coast": "Côte d'Ivoire",
-    "DR Congo": "Zaire",  # historical predecessor
-    "Cape Verde": "Cape Verde",
+# ---- Historical name resolution ----
+#
+# Some 2026 teams played at past World Cups under one or more *different*
+# names — either because the country was renamed (Zaire → DR Congo) or
+# because it succeeded a larger state that has since dissolved
+# (Czechoslovakia → Czech Republic + Slovakia, USSR → Russia, etc.).
+#
+# `HISTORICAL_NAMES` maps each 2026-draw team name to *every* name it has
+# played under in the historical dataset. The first entry is the team's
+# own modern name in the CSV; subsequent entries are predecessor states
+# whose World Cup record is inherited.
+#
+# Successor relationships follow FIFA's own treatment of national-team
+# records (e.g. Germany inherits West Germany's record; the modern
+# Russia federation inherits the Soviet Union's; Serbia inherits
+# Yugoslavia and Serbia and Montenegro).
+HISTORICAL_NAMES: dict[str, list[str]] = {
+    # ---- Spelling-only renames (one-to-one) ----
+    "Rep. of Korea":   ["South Korea"],
+    "USA":             ["United States"],
+    "IR Iran":         ["Iran"],
+    "Bosnia/Herzeg.":  ["Bosnia and Herzegovina"],
+    "Ivory Coast":     ["Ivory Coast"],
+    "Turkey":          ["Turkey"],          # Türkiye in some sources
+    # ---- Successor-state inheritances ----
+    "Czech Rep.":      ["Czech Republic", "Czechoslovakia"],
+    "Germany":         ["Germany", "West Germany"],
+    "Russia":          ["Russia", "Soviet Union"],
+    "Serbia":          ["Serbia", "Serbia and Montenegro", "Yugoslavia"],
+    "DR Congo":        ["Zaire"],
+    # ---- True debutants (kept here for completeness) ----
+    "Cape Verde":      ["Cape Verde"],
+    "Curaçao":         ["Curaçao"],
+    "Jordan":          ["Jordan"],
+    "Uzbekistan":      ["Uzbekistan"],
 }
 
-# Teams making their FIFA World Cup debut at 2026 (no prior tournament data).
-# Used to flag fallback projections.
-DEBUTANTS_2026 = {
-    "Cape Verde",
-    "Curaçao",
-    "Jordan",
-    "Uzbekistan",
-    "New Zealand",  # appeared 1982 & 2010, not a debut — kept off this list
+# Teams making their genuine FIFA World Cup debut in 2026 (no historical
+# data under any name). Used for documentation only — the prediction
+# engine detects debutants automatically by checking the dataset.
+DEBUTANTS_2026: set[str] = {
+    "Cape Verde", "Curaçao", "Jordan", "Uzbekistan",
 }
 
 # ---------------------------------------------------------------------------
@@ -204,6 +223,10 @@ def merge_results_into_history(
     `hist` is the long-format dataframe produced by `load_history` —
     one row per team-match. We add two rows per 2026 result so the
     prediction engine treats those games like any other World Cup match.
+
+    Each team is stored under its primary historical name so the lookup
+    keys stay consistent (e.g. a 2026 result for “Rep. of Korea” is
+    written as “South Korea”, matching the historical CSV).
     """
     if results.empty:
         return hist
@@ -211,9 +234,8 @@ def merge_results_into_history(
     for _, r in results.iterrows():
         h, a = r["home_team"], r["away_team"]
         hg, ag = int(r["home_score"]), int(r["away_score"])
-        # apply alias map so names line up with the historical naming scheme
-        h_canon = NAME_ALIASES.get(h, h)
-        a_canon = NAME_ALIASES.get(a, a)
+        h_canon = hist_name(h)  # primary historical spelling
+        a_canon = hist_name(a)
         rows.append({
             "year": 2026, "tournament_id": "WC-2026", "stage": "Group",
             "team": h_canon, "opponent": a_canon, "gf": hg, "ga": ag,
@@ -271,14 +293,29 @@ def load_draw() -> tuple[pd.DataFrame, pd.DataFrame]:
 # ---------------------------------------------------------------------------
 # Lookup helpers
 # ---------------------------------------------------------------------------
+def hist_names(team: str) -> list[str]:
+    """Return every historical name a 2026 team played under.
+
+    For most teams this is just the team's own name. For successor states
+    it includes predecessor names (e.g. Russia → [Russia, Soviet Union]).
+    """
+    return HISTORICAL_NAMES.get(team, [team])
+
+
 def hist_name(team: str) -> str:
-    """Return the team name as used in the historical CSV (apply aliases)."""
-    return NAME_ALIASES.get(team, team)
+    """Return the team's primary historical name (for display purposes)."""
+    return hist_names(team)[0]
+
+
+def team_history(hist: pd.DataFrame, team: str) -> pd.DataFrame:
+    """Slice of the tidy history dataframe for a team and all its predecessors."""
+    names = hist_names(team)
+    return hist[hist["team"].isin(names)]
 
 
 def is_debutant(team: str, hist: pd.DataFrame) -> bool:
-    """A team is a debutant if no World Cup matches are found in history."""
-    return hist[hist["team"] == hist_name(team)].empty
+    """A team is a debutant if no matches exist under any of its names."""
+    return team_history(hist, team).empty
 
 
 # ---------------------------------------------------------------------------
@@ -286,8 +323,22 @@ def is_debutant(team: str, hist: pd.DataFrame) -> bool:
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def team_stats(_hist: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate per-team historical World Cup statistics."""
-    g = _hist.groupby("team").agg(
+    """Aggregate per-team historical World Cup statistics.
+
+    Stats are keyed by **2026 team name** so successor states inherit
+    the records of their predecessors (e.g. Germany's row covers both
+    Germany and West Germany matches).
+    """
+    # Build a reverse lookup: every historical name → modern team name.
+    rev: dict[str, str] = {}
+    for modern, names in HISTORICAL_NAMES.items():
+        for n in names:
+            rev[n] = modern
+    # Any team not in the mapping keeps its own name.
+    df = _hist.copy()
+    df["team_modern"] = df["team"].map(lambda t: rev.get(t, t))
+
+    g = df.groupby("team_modern").agg(
         matches=("gf", "size"),
         wins=("result", lambda s: (s == "W").sum()),
         draws=("result", lambda s: (s == "D").sum()),
@@ -298,26 +349,34 @@ def team_stats(_hist: pd.DataFrame) -> pd.DataFrame:
         avg_ga=("ga", "mean"),
         first_year=("year", "min"),
         last_year=("year", "max"),
-    )
+    ).rename_axis("team").reset_index()
     g["win_pct"] = (g["wins"] / g["matches"] * 100).round(1)
     g["goal_diff"] = g["goals_for"] - g["goals_against"]
-    return g.reset_index()
+    return g
 
 
 def recent_form(hist: pd.DataFrame, team: str, n: int = 10) -> pd.DataFrame:
-    """Last n matches for a team (most recent first)."""
-    t = hist_name(team)
+    """Last n matches for a team (most recent first), including matches
+    played under any predecessor name.
+    """
+    df = team_history(hist, team).copy()
+    if df.empty:
+        return df
+    cols = ["year", "team", "opponent", "gf", "ga", "result", "stage"]
     return (
-        hist[hist["team"] == t]
-        .sort_values("year", ascending=False)
-        .head(n)[["year", "opponent", "gf", "ga", "result", "stage"]]
+        df.sort_values("year", ascending=False)
+        .head(n)[cols]
+        .rename(columns={"team": "played as"})
     )
 
 
 def head_to_head(hist: pd.DataFrame, team_a: str, team_b: str) -> dict:
-    """Return summary of all World Cup meetings between two teams."""
-    a, b = hist_name(team_a), hist_name(team_b)
-    df = hist[(hist["team"] == a) & (hist["opponent"] == b)]
+    """Return summary of every World Cup meeting between two teams,
+    including matches played under predecessor names.
+    """
+    a_names = hist_names(team_a)
+    b_names = hist_names(team_b)
+    df = hist[hist["team"].isin(a_names) & hist["opponent"].isin(b_names)]
     if df.empty:
         return {"played": 0}
     return {
@@ -362,8 +421,8 @@ def expected_goals(
     base_gf, base_ga = baseline_goals(hist)
     info: dict = {"debutant_a": False, "debutant_b": False}
 
-    # --- team A profile ---
-    a_hist = hist[hist["team"] == hist_name(team_a)]
+    # --- team A profile (uses every predecessor name) ---
+    a_hist = team_history(hist, team_a)
     if a_hist.empty:
         info["debutant_a"] = True
         a_attack = base_gf * debutant_strength
@@ -373,7 +432,7 @@ def expected_goals(
         a_defense = a_hist["ga"].mean()
 
     # --- team B profile ---
-    b_hist = hist[hist["team"] == hist_name(team_b)]
+    b_hist = team_history(hist, team_b)
     if b_hist.empty:
         info["debutant_b"] = True
         b_attack = base_gf * debutant_strength
@@ -720,11 +779,21 @@ def page_profiles(hist: pd.DataFrame, stats: pd.DataFrame, groups: pd.DataFrame)
         )
         return
 
-    s = stats[stats["team"] == hist_name(team)]
+    s = stats[stats["team"] == team]
     if s.empty:
         st.info("No historical data found.")
         return
     s = s.iloc[0]
+
+    # If the team inherits records from predecessor states, surface that.
+    names = hist_names(team)
+    predecessors = [n for n in names if n != team]
+    if predecessors:
+        st.info(
+            f"📜 Stats below include this team's record under previous "
+            f"name(s): **{', '.join(predecessors)}**."
+        )
+
     c = st.columns(5)
     c[0].metric("Matches played", int(s["matches"]))
     c[1].metric("Win %", f"{s['win_pct']:.1f}%")
@@ -737,7 +806,7 @@ def page_profiles(hist: pd.DataFrame, stats: pd.DataFrame, groups: pd.DataFrame)
 
     st.subheader("Goals timeline")
     timeline = (
-        hist[hist["team"] == hist_name(team)]
+        team_history(hist, team)
         .groupby("year")
         .agg(scored=("gf", "sum"), conceded=("ga", "sum"))
         .reset_index()
@@ -959,10 +1028,27 @@ Across all historical matches, the average team scores
 **{base_gf:.2f}** and concedes **{base_ga:.2f}** goals per match.
 These are the fall-back values for debutant teams.
 
-### What to do about debutant teams
+### Historical name resolution
 
-Some 2026 sides have *no* prior World Cup data
-(e.g. **Cape Verde**, **Curaçao**, **Jordan**, **Uzbekistan**).
+Several 2026 sides have played at past World Cups under a different name.
+The app inherits these records via the `HISTORICAL_NAMES` mapping in
+`app.py`:
+
+| 2026 team   | Inherits World Cup record of                                  |
+|-------------|---------------------------------------------------------------|
+| Czech Rep.  | Czech Republic + **Czechoslovakia**                           |
+| Germany     | Germany + **West Germany** (matches FIFA's own treatment)     |
+| Russia      | Russia + **Soviet Union**                                     |
+| Serbia      | Serbia + **Serbia and Montenegro** + **Yugoslavia**           |
+| DR Congo    | **Zaire**                                                     |
+
+Head-to-head lookups also use these aliases, so e.g. France-vs-Czech-Rep.
+at 2026 will see France's previous meetings with Czechoslovakia.
+
+### What to do about genuine debutant teams
+
+Some 2026 sides have *no* prior World Cup data under any name
+(**Cape Verde**, **Curaçao**, **Jordan**, **Uzbekistan**).
 Possible strategies — current implementation uses **option 1**, but
 you can swap in others by editing `expected_goals()` in `app.py`:
 
