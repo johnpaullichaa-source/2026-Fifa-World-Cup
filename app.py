@@ -1,0 +1,953 @@
+"""
+FIFA World Cup 2026 — Match Predictor & Dashboard
+=================================================
+Streamlit app that predicts every match in the 2026 FIFA World Cup
+(Canada / Mexico / USA) using historical World Cup data.
+
+Files expected in the same folder as app.py (or repo root):
+    - world-cup-Data-all-matches-2.csv   (historical match results, 1930-)
+    - WCup_2026_4.2.5_en.xlsx            (2026 draw / fixture file)
+    - results_2026.csv                   (optional, results as they come in)
+
+The results_2026.csv has columns:
+    match_no,home_team,away_team,home_score,away_score
+It can also be uploaded live from the sidebar (no file edit needed).
+
+Run locally:
+    pip install -r requirements.txt
+    streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from scipy.stats import poisson
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="FIFA World Cup 2026 Predictor",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Custom styling — clean, World-Cup-flavoured
+st.markdown(
+    """
+    <style>
+    .main { background-color: #0E1117; }
+    .stApp { background: linear-gradient(180deg, #0a1f3d 0%, #0E1117 30%); }
+    .metric-card {
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 16px;
+    }
+    .prob-bar { height: 26px; border-radius: 6px; }
+    h1, h2, h3 { color: #f5d76e; }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# Constants — file paths (relative so they work on Streamlit Cloud / GitHub)
+# ---------------------------------------------------------------------------
+ROOT = Path(__file__).parent
+HIST_CSV = ROOT / "world-cup-Data-all-matches-2.csv"
+DRAW_XLSX = ROOT / "WCup_2026_4.2.5_en.xlsx"
+RESULTS_CSV = ROOT / "results_2026.csv"
+
+RESULTS_TEMPLATE_COLUMNS = [
+    "match_no", "home_team", "away_team", "home_score", "away_score",
+]
+
+# Some country names differ between the historical CSV and the 2026 draw
+# file — map the 2026-draw spelling to the historical spelling so the
+# lookups line up cleanly.
+NAME_ALIASES: dict[str, str] = {
+    "Rep. of Korea": "Korea Republic",
+    "South Korea": "Korea Republic",
+    "Czech Rep.": "Czechoslovakia",  # closest historical predecessor
+    "Bosnia/Herzeg.": "Bosnia and Herzegovina",
+    "USA": "United States",
+    "IR Iran": "Iran",
+    "Ivory Coast": "Côte d'Ivoire",
+    "DR Congo": "Zaire",  # historical predecessor
+    "Cape Verde": "Cape Verde",
+}
+
+# Teams making their FIFA World Cup debut at 2026 (no prior tournament data).
+# Used to flag fallback projections.
+DEBUTANTS_2026 = {
+    "Cape Verde",
+    "Curaçao",
+    "Jordan",
+    "Uzbekistan",
+    "New Zealand",  # appeared 1982 & 2010, not a debut — kept off this list
+}
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_history() -> pd.DataFrame:
+    """Return tidy historical match dataframe with one row per team-match.
+
+    The CSV has one row per match (home/away). We "explode" it so each
+    team appears once per match — easier for averaging goals scored /
+    conceded and head-to-head lookups.
+    """
+    df = pd.read_csv(HIST_CSV)
+    df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
+    df["year"] = df["match_date"].dt.year
+
+    home = df[
+        [
+            "year", "tournament_id", "stage_name",
+            "home_team_name", "away_team_name",
+            "home_team_score", "away_team_score",
+        ]
+    ].copy()
+    home.columns = ["year", "tournament_id", "stage", "team", "opponent", "gf", "ga"]
+    home["venue"] = "home"
+
+    away = df[
+        [
+            "year", "tournament_id", "stage_name",
+            "away_team_name", "home_team_name",
+            "away_team_score", "home_team_score",
+        ]
+    ].copy()
+    away.columns = ["year", "tournament_id", "stage", "team", "opponent", "gf", "ga"]
+    away["venue"] = "away"
+
+    tidy = pd.concat([home, away], ignore_index=True)
+    tidy["result"] = np.select(
+        [tidy["gf"] > tidy["ga"], tidy["gf"] < tidy["ga"]],
+        ["W", "L"],
+        default="D",
+    )
+    return tidy
+
+
+def load_results_2026(uploaded=None) -> pd.DataFrame:
+    """Return a clean dataframe of 2026 results.
+
+    Source priority:
+      1. an uploaded file from the sidebar (Streamlit UploadedFile)
+      2. results_2026.csv next to app.py
+      3. empty dataframe with the right schema
+    """
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
+    elif RESULTS_CSV.exists():
+        df = pd.read_csv(RESULTS_CSV)
+    else:
+        return pd.DataFrame(columns=RESULTS_TEMPLATE_COLUMNS)
+
+    # Validate columns and coerce types
+    missing = [c for c in RESULTS_TEMPLATE_COLUMNS if c not in df.columns]
+    if missing:
+        st.sidebar.error(
+            f"Results CSV is missing column(s): {missing}. "
+            f"Required: {RESULTS_TEMPLATE_COLUMNS}"
+        )
+        return pd.DataFrame(columns=RESULTS_TEMPLATE_COLUMNS)
+    df = df[RESULTS_TEMPLATE_COLUMNS].copy()
+    df["match_no"] = pd.to_numeric(df["match_no"], errors="coerce").astype("Int64")
+    df["home_score"] = pd.to_numeric(df["home_score"], errors="coerce").astype("Int64")
+    df["away_score"] = pd.to_numeric(df["away_score"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["home_team", "away_team", "home_score", "away_score"])
+    return df
+
+
+def merge_results_into_history(
+    hist: pd.DataFrame, results: pd.DataFrame
+) -> pd.DataFrame:
+    """Append 2026 results to the historical (tidy) dataframe.
+
+    `hist` is the long-format dataframe produced by `load_history` —
+    one row per team-match. We add two rows per 2026 result so the
+    prediction engine treats those games like any other World Cup match.
+    """
+    if results.empty:
+        return hist
+    rows = []
+    for _, r in results.iterrows():
+        h, a = r["home_team"], r["away_team"]
+        hg, ag = int(r["home_score"]), int(r["away_score"])
+        # apply alias map so names line up with the historical naming scheme
+        h_canon = NAME_ALIASES.get(h, h)
+        a_canon = NAME_ALIASES.get(a, a)
+        rows.append({
+            "year": 2026, "tournament_id": "WC-2026", "stage": "Group",
+            "team": h_canon, "opponent": a_canon, "gf": hg, "ga": ag,
+            "venue": "home",
+            "result": "W" if hg > ag else ("L" if hg < ag else "D"),
+        })
+        rows.append({
+            "year": 2026, "tournament_id": "WC-2026", "stage": "Group",
+            "team": a_canon, "opponent": h_canon, "gf": ag, "ga": hg,
+            "venue": "away",
+            "result": "W" if ag > hg else ("L" if ag < hg else "D"),
+        })
+    return pd.concat([hist, pd.DataFrame(rows)], ignore_index=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_draw() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (groups_df, fixtures_df) parsed from the 2026 draw spreadsheet."""
+    # ---- Groups sheet ----
+    g_raw = pd.read_excel(DRAW_XLSX, sheet_name="Groups", header=None)
+    rows = []
+    current_group = None
+    for _, r in g_raw.iterrows():
+        slot, num, name = r[1], r[2], r[3]
+        if isinstance(name, str) and len(name) == 1 and name.isalpha():
+            current_group = name
+            continue
+        if isinstance(slot, str) and current_group and isinstance(name, str):
+            rows.append({"group": current_group, "slot": slot, "team": name.strip()})
+    groups = pd.DataFrame(rows)
+
+    # ---- Matches sheet ----
+    m_raw = pd.read_excel(DRAW_XLSX, sheet_name="Matches", header=None)
+    fixtures = []
+    for _, r in m_raw.iterrows():
+        no = r[1]
+        if not (isinstance(no, (int, float)) and pd.notna(no) and float(no).is_integer()):
+            continue
+        fixtures.append(
+            {
+                "match_no": int(no),
+                "slot1": r[2],
+                "slot2": r[3],
+                "date_local": r[4],
+                "venue": r[7],
+                "team1": r[8] if isinstance(r[8], str) else None,
+                "team2": r[9] if isinstance(r[9], str) else None,
+                "stage_label": r[12] if isinstance(r[12], str) else "Group",
+            }
+        )
+    fixtures = pd.DataFrame(fixtures)
+    return groups, fixtures
+
+
+# ---------------------------------------------------------------------------
+# Lookup helpers
+# ---------------------------------------------------------------------------
+def hist_name(team: str) -> str:
+    """Return the team name as used in the historical CSV (apply aliases)."""
+    return NAME_ALIASES.get(team, team)
+
+
+def is_debutant(team: str, hist: pd.DataFrame) -> bool:
+    """A team is a debutant if no World Cup matches are found in history."""
+    return hist[hist["team"] == hist_name(team)].empty
+
+
+# ---------------------------------------------------------------------------
+# Statistics — team strength
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def team_stats(_hist: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate per-team historical World Cup statistics."""
+    g = _hist.groupby("team").agg(
+        matches=("gf", "size"),
+        wins=("result", lambda s: (s == "W").sum()),
+        draws=("result", lambda s: (s == "D").sum()),
+        losses=("result", lambda s: (s == "L").sum()),
+        goals_for=("gf", "sum"),
+        goals_against=("ga", "sum"),
+        avg_gf=("gf", "mean"),
+        avg_ga=("ga", "mean"),
+        first_year=("year", "min"),
+        last_year=("year", "max"),
+    )
+    g["win_pct"] = (g["wins"] / g["matches"] * 100).round(1)
+    g["goal_diff"] = g["goals_for"] - g["goals_against"]
+    return g.reset_index()
+
+
+def recent_form(hist: pd.DataFrame, team: str, n: int = 10) -> pd.DataFrame:
+    """Last n matches for a team (most recent first)."""
+    t = hist_name(team)
+    return (
+        hist[hist["team"] == t]
+        .sort_values("year", ascending=False)
+        .head(n)[["year", "opponent", "gf", "ga", "result", "stage"]]
+    )
+
+
+def head_to_head(hist: pd.DataFrame, team_a: str, team_b: str) -> dict:
+    """Return summary of all World Cup meetings between two teams."""
+    a, b = hist_name(team_a), hist_name(team_b)
+    df = hist[(hist["team"] == a) & (hist["opponent"] == b)]
+    if df.empty:
+        return {"played": 0}
+    return {
+        "played": len(df),
+        "wins_a": int((df["result"] == "W").sum()),
+        "draws": int((df["result"] == "D").sum()),
+        "wins_b": int((df["result"] == "L").sum()),
+        "avg_gf_a": float(df["gf"].mean()),
+        "avg_gf_b": float(df["ga"].mean()),
+        "matches": df.sort_values("year", ascending=False),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Prediction engine — Poisson model with head-to-head adjustment
+# ---------------------------------------------------------------------------
+# Tournament-wide averages used as a baseline (and as the fallback for
+# debutant teams). Computed once from the historical dataset.
+def baseline_goals(hist: pd.DataFrame) -> tuple[float, float]:
+    return float(hist["gf"].mean()), float(hist["ga"].mean())
+
+
+def expected_goals(
+    hist: pd.DataFrame,
+    team_a: str,
+    team_b: str,
+    h2h_weight: float = 0.30,
+    debutant_strength: float = 0.85,
+) -> tuple[float, float, dict]:
+    """Return (lambda_a, lambda_b, info) — expected goals for each team.
+
+    Method:
+      1. Start from each team's historical attack (avg goals scored)
+         and defense (avg goals conceded) at the World Cup.
+      2. Combine them: team A's expected goals = mean(A.attack, B.defense).
+      3. If the two teams have met at past World Cups, blend the
+         head-to-head goal averages in (weight = h2h_weight).
+      4. For debutants (no history), fall back to the tournament-wide
+         baseline scaled by `debutant_strength` (a slight penalty
+         reflecting the difficulty of a first World Cup).
+    """
+    base_gf, base_ga = baseline_goals(hist)
+    info: dict = {"debutant_a": False, "debutant_b": False}
+
+    # --- team A profile ---
+    a_hist = hist[hist["team"] == hist_name(team_a)]
+    if a_hist.empty:
+        info["debutant_a"] = True
+        a_attack = base_gf * debutant_strength
+        a_defense = base_ga / debutant_strength  # leakier defense
+    else:
+        a_attack = a_hist["gf"].mean()
+        a_defense = a_hist["ga"].mean()
+
+    # --- team B profile ---
+    b_hist = hist[hist["team"] == hist_name(team_b)]
+    if b_hist.empty:
+        info["debutant_b"] = True
+        b_attack = base_gf * debutant_strength
+        b_defense = base_ga / debutant_strength
+    else:
+        b_attack = b_hist["gf"].mean()
+        b_defense = b_hist["ga"].mean()
+
+    # Blend attack vs opponent defense (each scaled by tournament average)
+    lam_a = (a_attack + b_defense) / 2
+    lam_b = (b_attack + a_defense) / 2
+
+    # Head-to-head adjustment
+    h2h = head_to_head(hist, team_a, team_b)
+    info["h2h"] = h2h
+    if h2h["played"] >= 1:
+        lam_a = (1 - h2h_weight) * lam_a + h2h_weight * h2h["avg_gf_a"]
+        lam_b = (1 - h2h_weight) * lam_b + h2h_weight * h2h["avg_gf_b"]
+
+    # Floor at a small positive value so Poisson works
+    lam_a = max(lam_a, 0.2)
+    lam_b = max(lam_b, 0.2)
+    return lam_a, lam_b, info
+
+
+def match_probabilities(
+    lam_a: float, lam_b: float, max_goals: int = 8
+) -> tuple[float, float, float, np.ndarray]:
+    """Return (P(A wins), P(draw), P(B wins), score-grid)."""
+    a = np.array([poisson.pmf(i, lam_a) for i in range(max_goals + 1)])
+    b = np.array([poisson.pmf(i, lam_b) for i in range(max_goals + 1)])
+    grid = np.outer(a, b)  # rows = team A goals, cols = team B goals
+    p_a = float(np.tril(grid, -1).sum())  # team A scores more
+    p_draw = float(np.trace(grid))
+    p_b = float(np.triu(grid, 1).sum())
+    return p_a, p_draw, p_b, grid
+
+
+def likely_scoreline(grid: np.ndarray) -> tuple[int, int, float]:
+    i, j = np.unravel_index(np.argmax(grid), grid.shape)
+    return int(i), int(j), float(grid[i, j])
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+def prob_bar(p_a: float, p_draw: float, p_b: float, team_a: str, team_b: str):
+    """Render a horizontal stacked probability bar."""
+    a_pct = p_a * 100
+    d_pct = p_draw * 100
+    b_pct = p_b * 100
+    html = f"""
+    <div style="display:flex;width:100%;border-radius:8px;overflow:hidden;
+                font-weight:600;color:white;height:32px;">
+      <div style="width:{a_pct}%;background:#1f77b4;display:flex;
+                  align-items:center;justify-content:center;font-size:13px;">
+        {team_a} {a_pct:.1f}%
+      </div>
+      <div style="width:{d_pct}%;background:#888;display:flex;
+                  align-items:center;justify-content:center;font-size:13px;">
+        Draw {d_pct:.1f}%
+      </div>
+      <div style="width:{b_pct}%;background:#d62728;display:flex;
+                  align-items:center;justify-content:center;font-size:13px;">
+        {team_b} {b_pct:.1f}%
+      </div>
+    </div>"""
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def predict_card(hist: pd.DataFrame, team_a: str, team_b: str):
+    """Render a full prediction card for one match."""
+    lam_a, lam_b, info = expected_goals(hist, team_a, team_b)
+    p_a, p_d, p_b, grid = match_probabilities(lam_a, lam_b)
+    sa, sb, p_score = likely_scoreline(grid)
+
+    prob_bar(p_a, p_d, p_b, team_a, team_b)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(f"{team_a} xG", f"{lam_a:.2f}")
+    c2.metric(f"{team_b} xG", f"{lam_b:.2f}")
+    c3.metric("Most likely score", f"{sa} – {sb}")
+    c4.metric("Score probability", f"{p_score*100:.1f}%")
+
+    flags = []
+    if info.get("debutant_a"):
+        flags.append(f"⚠️ {team_a} is a World Cup debutant — using baseline projection.")
+    if info.get("debutant_b"):
+        flags.append(f"⚠️ {team_b} is a World Cup debutant — using baseline projection.")
+    if info["h2h"]["played"] == 0:
+        flags.append("ℹ️ No prior World Cup meetings between these teams.")
+    else:
+        h = info["h2h"]
+        flags.append(
+            f"📊 Head-to-head: {h['played']} prior meetings — "
+            f"{team_a} {h['wins_a']}W / {h['draws']}D / {h['wins_b']}L "
+            f"(avg goals {h['avg_gf_a']:.2f}-{h['avg_gf_b']:.2f})."
+        )
+    for f in flags:
+        st.caption(f)
+
+
+# ===========================================================================
+# Main app
+# ===========================================================================
+def main() -> None:
+    if not HIST_CSV.exists() or not DRAW_XLSX.exists():
+        st.error(
+            "Missing data files. Place `world-cup-Data-all-matches-2.csv` "
+            "and `WCup_2026_4.2.5_en.xlsx` next to app.py."
+        )
+        st.stop()
+
+    base_hist = load_history()
+    groups, fixtures = load_draw()
+
+    # --- Sidebar nav ---
+    st.sidebar.title("⚽ World Cup 2026")
+    st.sidebar.caption("Canada · Mexico · USA")
+    page = st.sidebar.radio(
+        "Navigate",
+        ["🏟️ Dashboard", "🔮 Match Predictor", "👥 Team Profiles",
+         "🥇 Tournament Simulator", "📡 Live Results", "📐 Methodology"],
+    )
+
+    st.sidebar.divider()
+    st.sidebar.markdown("### 📡 2026 results feed")
+    uploaded = st.sidebar.file_uploader(
+        "Upload results CSV",
+        type=["csv"],
+        help=("Columns: match_no, home_team, away_team, home_score, away_score. "
+              "Re-upload any time to refresh predictions."),
+    )
+    results = load_results_2026(uploaded)
+    use_live = st.sidebar.toggle(
+        "Use 2026 results in the model",
+        value=True,
+        help="When on, completed 2026 matches feed back into team form for "
+             "later-round predictions.",
+    )
+
+    # Merge live results in if requested
+    hist = merge_results_into_history(base_hist, results) if use_live else base_hist
+    stats = team_stats(hist)
+
+    st.sidebar.divider()
+    st.sidebar.metric("Historical matches", f"{len(base_hist)//2:,}")
+    st.sidebar.metric("Teams in history", f"{base_hist['team'].nunique()}")
+    st.sidebar.metric("2026 results loaded", f"{len(results)}")
+    st.sidebar.metric("2026 fixtures", f"{len(fixtures)}")
+
+    # --- Pages ---
+    if page == "🏟️ Dashboard":
+        page_dashboard(hist, groups, fixtures, results)
+    elif page == "🔮 Match Predictor":
+        page_predictor(hist, groups)
+    elif page == "👥 Team Profiles":
+        page_profiles(hist, stats, groups)
+    elif page == "🥇 Tournament Simulator":
+        page_simulator(hist, fixtures, groups, results)
+    elif page == "📡 Live Results":
+        page_live_results(base_hist, fixtures, results)
+    else:
+        page_methodology(hist)
+
+
+# ---------------------------------------------------------------------------
+# Page: Dashboard — fixture list with predictions
+# ---------------------------------------------------------------------------
+def page_dashboard(
+    hist: pd.DataFrame,
+    groups: pd.DataFrame,
+    fixtures: pd.DataFrame,
+    results: pd.DataFrame,
+):
+    st.title("🏟️ World Cup 2026 — Fixture Dashboard")
+    st.caption("Browse every scheduled match. Predictions appear automatically "
+               "for fixtures with both teams confirmed. Played matches show the "
+               "actual scoreline alongside the prediction.")
+
+    # Build a lookup: match_no -> (home_score, away_score)
+    results_by_no = {
+        int(r["match_no"]): (int(r["home_score"]), int(r["away_score"]))
+        for _, r in results.iterrows()
+        if pd.notna(r["match_no"])
+    }
+
+    # Filters
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        stage_options = ["All"] + sorted(
+            fixtures["stage_label"].dropna().unique().tolist()
+        )
+        stage = st.selectbox("Stage", stage_options)
+    with c2:
+        group_options = ["All"] + sorted(groups["group"].unique().tolist())
+        group_filter = st.selectbox("Group (group stage only)", group_options)
+    with c3:
+        search = st.text_input("Search team", "")
+
+    df = fixtures.copy()
+    if stage != "All":
+        df = df[df["stage_label"] == stage]
+    if group_filter != "All":
+        teams_in_group = set(groups[groups["group"] == group_filter]["team"])
+        df = df[
+            df["team1"].isin(teams_in_group) | df["team2"].isin(teams_in_group)
+        ]
+    if search:
+        s = search.lower()
+        df = df[
+            df["team1"].fillna("").str.lower().str.contains(s)
+            | df["team2"].fillna("").str.lower().str.contains(s)
+        ]
+
+    st.markdown(f"**{len(df)} matches**")
+
+    for _, m in df.iterrows():
+        with st.container(border=True):
+            top = st.columns([1, 4, 2])
+            top[0].markdown(f"**Match {m['match_no']}**  \n{m['stage_label']}")
+            if m["team1"] and m["team2"]:
+                top[1].markdown(f"### {m['team1']} 🆚 {m['team2']}")
+            else:
+                top[1].markdown(f"### {m['slot1']} 🆚 {m['slot2']}")
+                top[1].caption("Knockout placeholder — opponents TBD")
+            try:
+                top[2].markdown(
+                    f"📅 {pd.to_datetime(m['date_local']).strftime('%a %d %b %Y · %H:%M')}"
+                    f"  \n📍 {m['venue']}"
+                )
+            except Exception:
+                top[2].markdown(f"📍 {m['venue']}")
+
+            if m["team1"] and m["team2"]:
+                actual = results_by_no.get(int(m["match_no"]))
+                if actual is not None:
+                    a_h, a_a = actual
+                    st.success(
+                        f"✅ **Played:** {m['team1']} {a_h} – {a_a} {m['team2']}"
+                    )
+                predict_card(hist, m["team1"], m["team2"])
+
+
+# ---------------------------------------------------------------------------
+# Page: Match Predictor — pick any two teams
+# ---------------------------------------------------------------------------
+def page_predictor(hist: pd.DataFrame, groups: pd.DataFrame):
+    st.title("🔮 Match Predictor")
+    st.caption("Pick any two 2026 teams to see win/draw/loss probabilities, "
+               "expected goals and head-to-head history.")
+
+    teams_2026 = sorted(groups["team"].dropna().unique().tolist())
+    c1, c2 = st.columns(2)
+    team_a = c1.selectbox("Team A", teams_2026, index=0)
+    team_b = c2.selectbox(
+        "Team B", teams_2026, index=min(1, len(teams_2026) - 1)
+    )
+
+    if team_a == team_b:
+        st.warning("Pick two different teams.")
+        return
+
+    st.divider()
+    predict_card(hist, team_a, team_b)
+
+    # --- Score-grid heatmap ---
+    lam_a, lam_b, _ = expected_goals(hist, team_a, team_b)
+    _, _, _, grid = match_probabilities(lam_a, lam_b, max_goals=6)
+    grid_df = pd.DataFrame(
+        (grid * 100).round(2),
+        index=[f"{i}" for i in range(grid.shape[0])],
+        columns=[f"{j}" for j in range(grid.shape[1])],
+    )
+    grid_df.index.name = team_a
+    grid_df.columns.name = team_b
+
+    st.subheader("Score-line probability grid (%)")
+    st.dataframe(
+        grid_df.style.background_gradient(cmap="YlOrRd").format("{:.2f}"),
+        use_container_width=True,
+    )
+
+    # --- Head-to-head detail ---
+    h = head_to_head(hist, team_a, team_b)
+    st.subheader("Head-to-head history (World Cup only)")
+    if h["played"] == 0:
+        st.info("These teams have never met at a FIFA World Cup.")
+    else:
+        st.write(
+            f"**{h['played']}** previous meeting(s) — "
+            f"{team_a} **{h['wins_a']}** wins, **{h['draws']}** draws, "
+            f"{team_b} **{h['wins_b']}** wins."
+        )
+        st.dataframe(
+            h["matches"][["year", "stage", "gf", "ga"]].rename(
+                columns={"gf": f"{team_a} goals", "ga": f"{team_b} goals"}
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Page: Team Profiles
+# ---------------------------------------------------------------------------
+def page_profiles(hist: pd.DataFrame, stats: pd.DataFrame, groups: pd.DataFrame):
+    st.title("👥 Team Profiles — 2026 Squads")
+
+    teams_2026 = sorted(groups["team"].dropna().unique().tolist())
+    team = st.selectbox("Choose a team", teams_2026)
+
+    g_row = groups[groups["team"] == team].iloc[0]
+    st.markdown(f"### {team}  ·  Group **{g_row['group']}**")
+
+    if is_debutant(team, hist):
+        st.warning(
+            f"🆕 **{team} are making their FIFA World Cup debut in 2026.** "
+            "There is no historical World Cup data, so all projections fall "
+            "back to the tournament-wide baseline (see Methodology page)."
+        )
+        return
+
+    s = stats[stats["team"] == hist_name(team)]
+    if s.empty:
+        st.info("No historical data found.")
+        return
+    s = s.iloc[0]
+    c = st.columns(5)
+    c[0].metric("Matches played", int(s["matches"]))
+    c[1].metric("Win %", f"{s['win_pct']:.1f}%")
+    c[2].metric("Avg goals scored", f"{s['avg_gf']:.2f}")
+    c[3].metric("Avg goals conceded", f"{s['avg_ga']:.2f}")
+    c[4].metric("Goal difference", int(s["goal_diff"]))
+
+    st.subheader("Recent World Cup form (last 10)")
+    st.dataframe(recent_form(hist, team, 10), use_container_width=True, hide_index=True)
+
+    st.subheader("Goals timeline")
+    timeline = (
+        hist[hist["team"] == hist_name(team)]
+        .groupby("year")
+        .agg(scored=("gf", "sum"), conceded=("ga", "sum"))
+        .reset_index()
+    )
+    st.line_chart(timeline.set_index("year"))
+
+
+# ---------------------------------------------------------------------------
+# Page: Tournament Simulator — run the group stage
+# ---------------------------------------------------------------------------
+def page_simulator(
+    hist: pd.DataFrame,
+    fixtures: pd.DataFrame,
+    groups: pd.DataFrame,
+    results: pd.DataFrame,
+):
+    st.title("🥇 Group-Stage Simulator")
+    st.caption("Plays out every group-stage match. Completed matches use the "
+               "actual scoreline; future matches use the model's expected goals.")
+
+    actual_by_no = {
+        int(r["match_no"]): (int(r["home_score"]), int(r["away_score"]))
+        for _, r in results.iterrows()
+        if pd.notna(r["match_no"])
+    }
+
+    # Build a quick {slot -> team} mapping from groups
+    slot_to_team = {}
+    for _, r in groups.iterrows():
+        slot_to_team[r["slot"]] = r["team"]
+
+    # Group-stage matches only (slots like A1, B3 — single letter + digit)
+    is_group_match = fixtures.apply(
+        lambda r: isinstance(r["slot1"], str)
+        and isinstance(r["slot2"], str)
+        and len(r["slot1"]) == 2
+        and r["slot1"][0].isalpha()
+        and r["slot1"][1].isdigit(),
+        axis=1,
+    )
+    group_fix = fixtures[is_group_match].copy()
+
+    # Compute predicted (or actual) points per team
+    table_rows = []
+    for _, m in group_fix.iterrows():
+        a, b = m["team1"], m["team2"]
+        if not (a and b):
+            continue
+        actual = actual_by_no.get(int(m["match_no"]))
+        if actual is not None:
+            ga, gb = actual
+            pts_a = 3 if ga > gb else (1 if ga == gb else 0)
+            pts_b = 3 if gb > ga else (1 if gb == ga else 0)
+            table_rows.append({"team": a, "xPts": pts_a, "xGF": ga, "xGA": gb})
+            table_rows.append({"team": b, "xPts": pts_b, "xGF": gb, "xGA": ga})
+        else:
+            lam_a, lam_b, _ = expected_goals(hist, a, b)
+            p_a, p_d, p_b, _ = match_probabilities(lam_a, lam_b)
+            # Expected points: P(W)*3 + P(D)*1
+            table_rows.append({"team": a, "xPts": p_a * 3 + p_d, "xGF": lam_a, "xGA": lam_b})
+            table_rows.append({"team": b, "xPts": p_b * 3 + p_d, "xGF": lam_b, "xGA": lam_a})
+
+    df = pd.DataFrame(table_rows)
+    agg = df.groupby("team").agg(
+        xPts=("xPts", "sum"),
+        xGF=("xGF", "sum"),
+        xGA=("xGA", "sum"),
+    )
+    agg["xGD"] = agg["xGF"] - agg["xGA"]
+    agg = agg.merge(
+        groups.set_index("team")[["group"]], left_index=True, right_index=True
+    )
+
+    for grp in sorted(agg["group"].unique()):
+        st.subheader(f"Group {grp}")
+        sub = (
+            agg[agg["group"] == grp]
+            .sort_values(["xPts", "xGD", "xGF"], ascending=False)
+            .drop(columns=["group"])
+            .round(2)
+        )
+        sub.insert(0, "Predicted finish", range(1, len(sub) + 1))
+        st.dataframe(sub, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Page: Live Results — accuracy tracker + CSV template + download
+# ---------------------------------------------------------------------------
+def page_live_results(
+    base_hist: pd.DataFrame,
+    fixtures: pd.DataFrame,
+    results: pd.DataFrame,
+):
+    st.title("📡 Live 2026 Results")
+    st.caption("Track results as they come in and see how the model is doing.")
+
+    # --- Template download ---
+    with st.expander("📋 First time? Download the results CSV template", expanded=results.empty):
+        template = pd.DataFrame(
+            [
+                {"match_no": m["match_no"],
+                 "home_team": m["team1"],
+                 "away_team": m["team2"],
+                 "home_score": "",
+                 "away_score": ""}
+                for _, m in fixtures.iterrows()
+                if m["team1"] and m["team2"]
+            ]
+        )
+        st.markdown(
+            "Pre-filled with every match where both teams are known. "
+            "Fill in `home_score` / `away_score` as games are played, save as CSV, "
+            "and upload from the sidebar."
+        )
+        st.download_button(
+            "⬇️ Download template (results_2026_template.csv)",
+            template.to_csv(index=False).encode("utf-8"),
+            file_name="results_2026_template.csv",
+            mime="text/csv",
+        )
+
+    if results.empty:
+        st.info(
+            "No results uploaded yet. Use the **Upload results CSV** control "
+            "in the sidebar once games start."
+        )
+        return
+
+    # --- Accuracy: predicted vs actual ---
+    st.subheader("Predicted vs actual")
+    rows = []
+    for _, r in results.iterrows():
+        mn = int(r["match_no"]) if pd.notna(r["match_no"]) else None
+        h, a = r["home_team"], r["away_team"]
+        hg, ag = int(r["home_score"]), int(r["away_score"])
+        # Predict using the *base* history (no leakage — predict pre-tournament)
+        lam_a, lam_b, _ = expected_goals(base_hist, h, a)
+        p_a, p_d, p_b, grid = match_probabilities(lam_a, lam_b)
+        sa, sb, _ = likely_scoreline(grid)
+        actual_outcome = "H" if hg > ag else ("A" if hg < ag else "D")
+        pred_outcome = "H" if p_a > max(p_d, p_b) else (
+            "A" if p_b > max(p_a, p_d) else "D"
+        )
+        # Probability the model assigned to what actually happened
+        p_correct = {"H": p_a, "D": p_d, "A": p_b}[actual_outcome]
+        rows.append({
+            "Match": f"{h} vs {a}",
+            "Predicted": f"{sa}–{sb}",
+            "Actual": f"{hg}–{ag}",
+            "Outcome correct": "✅" if pred_outcome == actual_outcome else "❌",
+            "Exact score": "✅" if (sa, sb) == (hg, ag) else "❌",
+            "Model P(actual)": round(p_correct, 3),
+        })
+    acc_df = pd.DataFrame(rows)
+    st.dataframe(acc_df, use_container_width=True, hide_index=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    n = len(acc_df)
+    correct_outcomes = (acc_df["Outcome correct"] == "✅").sum()
+    correct_scores = (acc_df["Exact score"] == "✅").sum()
+    avg_p = acc_df["Model P(actual)"].mean()
+    c1.metric("Matches played", n)
+    c2.metric("Outcome accuracy", f"{correct_outcomes/n*100:.1f}%" if n else "–")
+    c3.metric("Exact-score hits", f"{correct_scores/n*100:.1f}%" if n else "–")
+    c4.metric(
+        "Avg model confidence",
+        f"{avg_p*100:.1f}%" if n else "–",
+        help="Average probability the model assigned to what actually happened. "
+             "Higher is better.",
+    )
+
+    st.divider()
+    st.subheader("Loaded results")
+    st.dataframe(results, use_container_width=True, hide_index=True)
+    st.download_button(
+        "⬇️ Download current results CSV",
+        results.to_csv(index=False).encode("utf-8"),
+        file_name="results_2026.csv",
+        mime="text/csv",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page: Methodology
+# ---------------------------------------------------------------------------
+def page_methodology(hist: pd.DataFrame):
+    st.title("📐 Methodology & Notes")
+
+    base_gf, base_ga = baseline_goals(hist)
+    st.markdown(
+        f"""
+### How predictions are made
+
+The engine is a **bivariate Poisson model** — the standard statistical
+approach for football scorelines.
+
+**Step 1 — Team profile.** For each team, compute their average goals
+scored and conceded across every World Cup match in the dataset
+(`world-cup-Data-all-matches-2.csv`, {len(hist)//2:,} matches).
+
+**Step 2 — Expected goals (xG).** For team A vs team B,
+expected goals for A is the average of A's *attack rate* and B's
+*defense rate*. This balances who scores often against who concedes often.
+
+**Step 3 — Head-to-head adjustment.** If the two teams have met at a
+previous World Cup, blend the historical head-to-head goal averages
+into the xG (default weight: 30%).
+
+**Step 4 — Match probabilities.** With expected goals λₐ and λ_b,
+each team's goal count follows a Poisson distribution. We compute the
+full score-line grid `P(A=i, B=j) = Pois(i; λₐ) · Pois(j; λ_b)` then
+sum the appropriate cells for win / draw / loss probabilities.
+
+The **most likely scoreline** is the highest-probability cell in the grid.
+
+### Tournament baseline
+
+Across all historical matches, the average team scores
+**{base_gf:.2f}** and concedes **{base_ga:.2f}** goals per match.
+These are the fall-back values for debutant teams.
+
+### What to do about debutant teams
+
+Some 2026 sides have *no* prior World Cup data
+(e.g. **Cape Verde**, **Curaçao**, **Jordan**, **Uzbekistan**).
+Possible strategies — current implementation uses **option 1**, but
+you can swap in others by editing `expected_goals()` in `app.py`:
+
+1. **Tournament-baseline fallback (default).** Use the all-time average
+   goals-scored / goals-conceded, scaled by `debutant_strength`
+   (default 0.85, a small penalty since first-timers historically
+   underperform). Simple, no extra data required.
+
+2. **FIFA-ranking-based prior.** Pull the team's current FIFA Coca-Cola
+   ranking and map it to an attack/defense rating using a logistic
+   curve. More accurate but requires an extra data source.
+
+3. **Continental peer benchmark.** Use the average of confederation
+   peers (e.g. give Cape Verde the average stats of African teams' first
+   World Cup appearances). Reasonable middle-ground.
+
+4. **Qualifying-campaign data.** Use goals scored/conceded during the
+   2026 qualifying tournament. Best signal but means joining another
+   dataset.
+
+5. **Bayesian shrinkage.** Start every team — debutant or not — at the
+   tournament baseline and shrink toward their own average proportional
+   to `matches_played / (matches_played + k)`. Avoids the binary
+   debutant/veteran cliff.
+
+### Limitations
+
+* Historical World Cup data only — domestic and continental form is ignored.
+* Team strengths drift over decades; the model treats 1950 Brazil and
+  2022 Brazil identically. A time-decay weight could be added.
+* Home-advantage is not modelled (2026 has three hosts).
+* Penalty shoot-outs and extra time are not modelled separately.
+"""
+    )
+
+
+if __name__ == "__main__":
+    main()
