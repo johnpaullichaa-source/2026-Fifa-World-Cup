@@ -47,8 +47,8 @@ st.markdown(
     <style>
     /* ---- Light mode (default) ---- */
     :root {
-        --wc-heading: #0e1a35;       /* deep navy — readable on white */
-        --wc-accent:  #d11242;       /* World Cup red */
+        --wc-heading: #0a1f3d;       /* deep navy — readable on white */
+        --wc-accent:  #c8102e;       /* World Cup red */
         --wc-card-bg: rgba(10,31,61,0.04);
         --wc-card-bd: rgba(10,31,61,0.12);
         --wc-team-a:  #1f4e8c;       /* navy blue */
@@ -75,11 +75,10 @@ st.markdown(
     .metric-card {
         background: var(--wc-card-bg);
         border: 1px solid var(--wc-card-bd);
-        border-radius: 16px;
+        border-radius: 12px;
         padding: 16px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     }
-    .prob-bar { height: 32px; border-radius: 8px; }
+    .prob-bar { height: 26px; border-radius: 6px; }
     .stTabs [data-baseweb="tab-list"] { gap: 8px; }
     </style>
     """,
@@ -689,13 +688,11 @@ def predict_card(
     sa, sb, p_score = likely_scoreline(grid)
 
     prob_bar(p_a, p_d, p_b, team_a, team_b)
-    st.divider()
-    c1, c2 = st.columns(2)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric(f"{team_a} xG", f"{lam_a:.2f}")
     c2.metric(f"{team_b} xG", f"{lam_b:.2f}")
-    c3, c4 = st.columns(2)
-    c3.metric("Likely score", f"{sa} – {sb}")
-    c4.metric("Score prob", f"{p_score*100:.1f}%")
+    c3.metric("Most likely score", f"{sa} – {sb}")
+    c4.metric("Score probability", f"{p_score*100:.1f}%")
 
     flags = []
     if info.get("debutant_a"):
@@ -883,33 +880,31 @@ def page_dashboard(
 
     st.markdown(f"**{len(df)} matches**")
 
-    cols = st.columns(2)
-    for i, (_, m) in enumerate(df.iterrows()):
-        with cols[i % 2]:
-            with st.container(border=True):
-                top = st.columns([1, 3, 2])
-                top[0].markdown(f"**Match {m['match_no']}**  \n{m['stage_label']}")
-                if m["team1"] and m["team2"]:
-                    top[1].markdown(f"### {m['team1']} 🆚 {m['team2']}")
-                else:
-                    top[1].markdown(f"### {m['slot1']} 🆚 {m['slot2']}")
-                    top[1].caption("Knockout placeholder — opponents TBD")
-                try:
-                    top[2].markdown(
-                        f"📅 {pd.to_datetime(m['date_local']).strftime('%a %d %b %Y · %H:%M')}"
-                        f"  \n📍 {m['venue']}"
-                    )
-                except Exception:
-                    top[2].markdown(f"📍 {m['venue']}")
+    for _, m in df.iterrows():
+        with st.container(border=True):
+            top = st.columns([1, 4, 2])
+            top[0].markdown(f"**Match {m['match_no']}**  \n{m['stage_label']}")
+            if m["team1"] and m["team2"]:
+                top[1].markdown(f"### {m['team1']} 🆚 {m['team2']}")
+            else:
+                top[1].markdown(f"### {m['slot1']} 🆚 {m['slot2']}")
+                top[1].caption("Knockout placeholder — opponents TBD")
+            try:
+                top[2].markdown(
+                    f"📅 {pd.to_datetime(m['date_local']).strftime('%a %d %b %Y · %H:%M')}"
+                    f"  \n📍 {m['venue']}"
+                )
+            except Exception:
+                top[2].markdown(f"📍 {m['venue']}")
 
-                if m["team1"] and m["team2"]:
-                    actual = results_by_no.get(int(m["match_no"]))
-                    if actual is not None:
-                        a_h, a_a = actual
-                        st.success(
-                            f"✅ **Played:** {m['team1']} {a_h} – {a_a} {m['team2']}"
-                        )
-                    predict_card(hist, m["team1"], m["team2"], qual, qualifier_weight)
+            if m["team1"] and m["team2"]:
+                actual = results_by_no.get(int(m["match_no"]))
+                if actual is not None:
+                    a_h, a_a = actual
+                    st.success(
+                        f"✅ **Played:** {m['team1']} {a_h} – {a_a} {m['team2']}"
+                    )
+                predict_card(hist, m["team1"], m["team2"], qual, qualifier_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -1047,13 +1042,12 @@ def page_profiles(
             f"name(s): **{', '.join(predecessors)}**."
         )
 
-    with st.container(border=True):
-        c = st.columns(5)
-        c[0].metric("Matches played", int(s["matches"]))
-        c[1].metric("Win %", f"{s['win_pct']:.1f}%")
-        c[2].metric("Avg goals scored", f"{s['avg_gf']:.2f}")
-        c[3].metric("Avg goals conceded", f"{s['avg_ga']:.2f}")
-        c[4].metric("Goal difference", int(s["goal_diff"]))
+    c = st.columns(5)
+    c[0].metric("Matches played", int(s["matches"]))
+    c[1].metric("Win %", f"{s['win_pct']:.1f}%")
+    c[2].metric("Avg goals scored", f"{s['avg_gf']:.2f}")
+    c[3].metric("Avg goals conceded", f"{s['avg_ga']:.2f}")
+    c[4].metric("Goal difference", int(s["goal_diff"]))
 
     st.subheader("Recent World Cup form (last 10)")
     st.dataframe(recent_form(hist, team, 10), use_container_width=True, hide_index=True)
