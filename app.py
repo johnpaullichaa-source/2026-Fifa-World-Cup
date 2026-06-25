@@ -783,10 +783,10 @@ def main() -> None:
         disabled=not use_qualifiers,
     )
     st.sidebar.caption(
-        "💡 Defaults retuned against the first 28 played 2026 matches "
-        "(qualifier weight 0.35 → 0.75, head-to-head 0.30 → 0.20, "
-        "debutant strength 0.85 → 0.70). Lifts outcome accuracy from 46% "
-        "to 57% on the played sample."
+        "💡 Defaults calibrated against the 56 played 2026 matches "
+        "(group stage complete). Calibrated config nails 62.5% of "
+        "outcomes vs 53.6% for the original defaults. Flip on "
+        "‘Use 2026 results in the model’ below for another small boost."
     )
 
     st.sidebar.markdown("### 📡 2026 results feed")
@@ -1376,30 +1376,35 @@ you can swap in others by editing `expected_goals()` in `app.py`:
 
 ### Calibration against played 2026 matches
 
-After matchdays 1–2 of the 2026 tournament (28 played matches), we
-swept the three main parameters against the actual results and picked
-the combination that minimised log-loss on the outcome (Win / Draw /
-Loss):
+The model defaults have been calibrated twice against actual results.
+We sweep the three main parameters and pick the combination that
+best fits real outcomes (Win / Draw / Loss).
 
-| Parameter           | Old default | Calibrated | Effect                                           |
-|---------------------|-------------|------------|--------------------------------------------------|
-| `qualifier_weight`  | 0.35        | **0.75**   | Trust 2026 form more — it's the freshest signal  |
-| `h2h_weight`        | 0.30        | **0.20**   | Old WC meetings matter less than current form    |
-| `debutant_strength` | 0.85        | **0.70**   | Treat debutants a touch more cautiously          |
+**Calibrated defaults (set after matchday 2, confirmed at matchday 3):**
 
-**Result on the 28 played matches:**
+| Parameter           | Original | **Calibrated** | Effect                                           |
+|---------------------|----------|----------------|--------------------------------------------------|
+| `qualifier_weight`  | 0.35     | **0.75**       | Trust 2026 form more — it's the freshest signal  |
+| `h2h_weight`        | 0.30     | **0.20**       | Old WC meetings matter less than current form    |
+| `debutant_strength` | 0.85     | **0.70**       | Treat debutants a touch more cautiously          |
 
-| Metric           | Old defaults | Calibrated |
-|------------------|--------------|------------|
-| Outcome accuracy | 46.4%        | **57.1%**  |
-| Log-loss         | 1.063        | **1.039**  |
-| Brier score      | 0.646        | **0.625**  |
-| Goals MAE        | 1.113        | **1.058**  |
+**Performance vs. actual results:**
+
+| Sample size           | Original defaults | Calibrated defaults | + live results feed |
+|-----------------------|-------------------|---------------------|---------------------|
+| 28 matches (MD1–2)    | 46.4% accuracy    | **57.1%**           | n/a (too sparse)    |
+| 56 matches (MD1–3)    | 53.6% accuracy    | **62.5%**           | 62.5%               |
+
+With only 28 matches, feeding played results back into the model
+didn't help (each team had ≤2 datapoints). With 56 matches, the
+"Use 2026 results in the model" toggle now lifts the *baseline*
+config from 53.6% to 58.9% — turn it on once the group stage is
+complete.
 
 The biggest single lesson: **2026 qualifying form is a much stronger
-predictor than historical World Cup form** for this tournament — squads
-turn over, qualifying is recent, and several heavy WC names (Spain,
-Brazil) have already underperformed their long-run averages while
+predictor than historical World Cup form** for this tournament —
+squads turn over, qualifying is recent, and several heavy WC names
+(Spain, Brazil) have underperformed their long-run averages while
 strong qualifiers (Sweden, Germany, Canada, England) have backed it up.
 You can revert to the older settings via the sidebar sliders if you'd
 like to A/B test.
