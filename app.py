@@ -21,6 +21,7 @@ Run locally:
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -760,6 +761,7 @@ def main() -> None:
         "Navigate",
         ["🏟️ Dashboard", "🔮 Match Predictor", "👥 Team Profiles",
          "🥇 Tournament Simulator", "🏆 Knockout Simulator",
+         "📈 Team Stats",
          "📡 Live Results", "📐 Methodology"],
     )
 
@@ -831,6 +833,8 @@ def main() -> None:
         page_simulator(hist, fixtures, groups, results, qual_in_use, qual_w)
     elif page == "🏆 Knockout Simulator":
         page_knockout_simulator(results)
+    elif page == "📈 Team Stats":
+        page_team_stats()
     elif page == "📡 Live Results":
         page_live_results(base_hist, fixtures, results, qual_in_use, qual_w)
     else:
@@ -1146,22 +1150,153 @@ def tournament_form_profile(results: pd.DataFrame) -> dict[str, dict]:
     return profile
 
 
+# ---------------------------------------------------------------------------
+# Fox Sports per-process team stats (offensive & defensive)
+# Source: foxsports.com/soccer/fifa-world-cup-men/team-stats — 2026 season
+# ---------------------------------------------------------------------------
+FOX_STATS_PATH = Path(__file__).resolve().parent / "fox_sports_stats.json"
+
+# Fox Sports name → canonical app name
+FOX_ALIAS = {
+    "Czechia": "Czech Rep.",
+    "Türkiye": "Turkey",
+    "Turkiye": "Turkey",
+    "Congo DR": "DR Congo",
+    "Democratic Republic of the Congo": "DR Congo",
+    "Bosnia and Herzegovina": "Bosnia/Herzeg.",
+    "United States": "USA",
+    "Côte d'Ivoire": "Ivory Coast",
+    "Cote d'Ivoire": "Ivory Coast",
+    "South Korea": "Korea Republic",
+    "Cape Verde Islands": "Cape Verde",
+    "Cabo Verde": "Cape Verde",
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_fox_stats() -> list[dict]:
+    """Load the Fox Sports per-process team stats JSON.
+
+    Returns a list of dicts: {team, offensive: {...}, defensive: {...}}.
+    Returns [] if the file is missing.
+    """
+    if not FOX_STATS_PATH.exists():
+        return []
+    try:
+        data = json.loads(FOX_STATS_PATH.read_text())
+    except Exception:
+        return []
+    # Canonicalise team names
+    for rec in data:
+        rec["team"] = FOX_ALIAS.get(rec["team"], rec["team"])
+    return data
+
+
+@st.cache_data(show_spinner=False)
+def build_team_strengths(_fox: list[dict] | None = None) -> dict[str, dict[str, float]]:
+    """Build per-team attack and defence strength scores (z-scores over the 48 teams).
+
+    Attack uses shots on goal/game, chances created/game, possession %, passing accuracy.
+    Defence uses tackles/game, interceptions/game, MINUS fouls/game (less reckless).
+
+    Higher = stronger. A team with no defensive stats gets defence=0 (neutral).
+    Returns dict: canonical team -> {"attack": z, "defence": z}.
+    """
+    fox = _fox if _fox is not None else load_fox_stats()
+    if not fox:
+        return {}
+
+    rows = []
+    for s in fox:
+        o = s.get("offensive") or {}
+        d = s.get("defensive") or {}
+        gp_o = max(int(o.get("GP") or 1), 1)
+        gp_d = max(int(d.get("GP") or gp_o), 1) if d else gp_o
+        rows.append({
+            "team":   s["team"],
+            "sog_pg": (o.get("SOG") or 0) / gp_o,
+            "cc_pg":  (o.get("CC")  or 0) / gp_o,
+            "poss":   float(o.get("POSS") or 50),
+            "pa":     float(o.get("PA") or 0.7),
+            "tkl_pg": ((d.get("TKL") or 0) / gp_d) if d else None,
+            "int_pg": ((d.get("INT") or 0) / gp_d) if d else None,
+            "f_pg":   ((d.get("F")   or 0) / gp_d) if d else None,
+        })
+
+    def _z(values):
+        arr = np.array([v for v in values if v is not None], dtype=float)
+        if len(arr) == 0:
+            return 0.0, 1.0
+        mu = float(arr.mean())
+        sd = float(arr.std(ddof=0)) or 1.0
+        return mu, sd
+
+    sog_mu, sog_sd = _z([r["sog_pg"] for r in rows])
+    cc_mu,  cc_sd  = _z([r["cc_pg"]  for r in rows])
+    poss_mu, poss_sd = _z([r["poss"] for r in rows])
+    pa_mu,  pa_sd  = _z([r["pa"]  for r in rows])
+    tkl_mu, tkl_sd = _z([r["tkl_pg"] for r in rows])
+    int_mu, int_sd = _z([r["int_pg"] for r in rows])
+    f_mu,   f_sd   = _z([r["f_pg"]   for r in rows])
+
+    def _zs(x, mu, sd):
+        return 0.0 if x is None else (x - mu) / sd
+
+    strengths: dict[str, dict[str, float]] = {}
+    for r in rows:
+        attack = float(np.mean([
+            _zs(r["sog_pg"], sog_mu, sog_sd),
+            _zs(r["cc_pg"],  cc_mu,  cc_sd),
+            _zs(r["poss"],   poss_mu, poss_sd),
+            _zs(r["pa"],     pa_mu, pa_sd),
+        ]))
+        if r["tkl_pg"] is None:
+            defence = 0.0
+        else:
+            defence = float(np.mean([
+                _zs(r["tkl_pg"], tkl_mu, tkl_sd),
+                _zs(r["int_pg"], int_mu, int_sd),
+                -_zs(r["f_pg"],   f_mu, f_sd),
+            ]))
+        strengths[r["team"]] = {"attack": attack, "defence": defence}
+    return strengths
+
+
 def knockout_expected_goals(
     team_a: str,
     team_b: str,
     form: dict[str, dict],
     tournament_avg: float,
+    strengths: dict[str, dict[str, float]] | None = None,
+    fox_weight: float = 0.0,
 ) -> tuple[float, float]:
-    """Expected goals for a knockout match using ONLY 2026 tournament form.
+    """Expected goals for a knockout match.
 
-    λ_A = (A's goals-scored per game) × (B's goals-conceded per game) / tournament_avg
+    Base: λ_A = (A's goals-scored per game) × (B's goals-conceded per game) / tournament_avg.
     Knockout suppression: shrink λ by 8% (knockouts are cagier than groups).
+
+    Fox blend (when `strengths` is provided and `fox_weight > 0`): each team's
+    attack-z and the opponent's defence-z are folded into λ via a multiplier
+        m_A = (1 + w·atk_A) · (1 − w·def_B)
+    where w = fox_weight. Defence-z is *positive when good* so we subtract it
+    in the opponent's λ. Multiplier is clipped to [0.55, 1.65] so a single
+    Fox stat can never more than ~double or halve a team's xG.
     """
     KNOCKOUT_SUPPRESSION = 0.92
     a = form.get(team_a, {"gf_per": tournament_avg, "ga_per": tournament_avg})
     b = form.get(team_b, {"gf_per": tournament_avg, "ga_per": tournament_avg})
     lam_a = max(0.15, a["gf_per"] * b["ga_per"] / max(tournament_avg, 0.1))
     lam_b = max(0.15, b["gf_per"] * a["ga_per"] / max(tournament_avg, 0.1))
+
+    if strengths and fox_weight > 0:
+        sa = strengths.get(team_a, {"attack": 0.0, "defence": 0.0})
+        sb = strengths.get(team_b, {"attack": 0.0, "defence": 0.0})
+        w = float(fox_weight)
+        m_a = max(0.55, min(1.65, (1 + w * sa["attack"]) * (1 - w * sb["defence"])))
+        m_b = max(0.55, min(1.65, (1 + w * sb["attack"]) * (1 - w * sa["defence"])))
+        lam_a *= m_a
+        lam_b *= m_b
+
     return lam_a * KNOCKOUT_SUPPRESSION, lam_b * KNOCKOUT_SUPPRESSION
 
 
@@ -1170,6 +1305,8 @@ def knockout_win_prob(
     team_b: str,
     form: dict[str, dict],
     tournament_avg: float,
+    strengths: dict[str, dict[str, float]] | None = None,
+    fox_weight: float = 0.0,
 ) -> tuple[float, float, float, float]:
     """P(A wins after ET/pens), P(B wins), expected goals λ_a, λ_b.
 
@@ -1177,7 +1314,10 @@ def knockout_win_prob(
     proportionally to each team's regulation win probability (a
     standard approximation for ET + penalty shootouts).
     """
-    lam_a, lam_b = knockout_expected_goals(team_a, team_b, form, tournament_avg)
+    lam_a, lam_b = knockout_expected_goals(
+        team_a, team_b, form, tournament_avg,
+        strengths=strengths, fox_weight=fox_weight,
+    )
     p_a, p_d, p_b, _ = match_probabilities(lam_a, lam_b)
     if p_a + p_b < 1e-9:
         return 0.5, 0.5, lam_a, lam_b
@@ -1192,6 +1332,8 @@ def simulate_knockouts(
     tournament_avg: float,
     n_sims: int = 20000,
     rng_seed: int = 42,
+    strengths: dict[str, dict[str, float]] | None = None,
+    fox_weight: float = 0.0,
 ) -> dict:
     """Monte Carlo through R32 → R16 → QF → SF → Final.
 
@@ -1206,7 +1348,10 @@ def simulate_knockouts(
         key = (a, b)
         if key in win_cache:
             return win_cache[key]
-        pa, _, _, _ = knockout_win_prob(a, b, form, tournament_avg)
+        pa, _, _, _ = knockout_win_prob(
+            a, b, form, tournament_avg,
+            strengths=strengths, fox_weight=fox_weight,
+        )
         win_cache[key] = pa
         win_cache[(b, a)] = 1 - pa
         return pa
@@ -1258,11 +1403,15 @@ def simulate_knockouts(
     return probs
 
 
-def _resolve_match(team_a, team_b, form, tournament_avg):
+def _resolve_match(team_a, team_b, form, tournament_avg,
+                   strengths=None, fox_weight=0.0):
     """Single-shot match resolution for the deterministic bracket walk.
     Returns (winner, score_a, score_b, et_flag).
     """
-    pa, pb, la, lb = knockout_win_prob(team_a, team_b, form, tournament_avg)
+    pa, pb, la, lb = knockout_win_prob(
+        team_a, team_b, form, tournament_avg,
+        strengths=strengths, fox_weight=fox_weight,
+    )
     # Modal scoreline
     a = np.array([poisson.pmf(i, la * 1.0) for i in range(8)])
     b = np.array([poisson.pmf(i, lb * 1.0) for i in range(8)])
@@ -1287,17 +1436,21 @@ def _resolve_match(team_a, team_b, form, tournament_avg):
     return winner, sa, sb, et
 
 
-def walk_bracket(bracket, form, tournament_avg):
+def walk_bracket(bracket, form, tournament_avg,
+                 strengths=None, fox_weight=0.0):
     """Resolve the entire knockout tree deterministically (favourite advances)."""
-    r32 = [_resolve_match(a, b, form, tournament_avg) for a, b in bracket]
+    def resolve(a, b):
+        return _resolve_match(a, b, form, tournament_avg,
+                              strengths=strengths, fox_weight=fox_weight)
+    r32 = [resolve(a, b) for a, b in bracket]
     r16p = [(r32[i][0], r32[i+1][0]) for i in range(0, 16, 2)]
-    r16 = [_resolve_match(a, b, form, tournament_avg) for a, b in r16p]
+    r16 = [resolve(a, b) for a, b in r16p]
     qfp  = [(r16[i][0], r16[i+1][0]) for i in range(0, 8, 2)]
-    qf  = [_resolve_match(a, b, form, tournament_avg) for a, b in qfp]
+    qf  = [resolve(a, b) for a, b in qfp]
     sfp  = [(qf[i][0], qf[i+1][0]) for i in range(0, 4, 2)]
-    sf  = [_resolve_match(a, b, form, tournament_avg) for a, b in sfp]
+    sf  = [resolve(a, b) for a, b in sfp]
     finalp = (sf[0][0], sf[1][0])
-    final = _resolve_match(*finalp, form, tournament_avg)
+    final = resolve(*finalp)
     return {"R32":(bracket, r32), "R16":(r16p, r16), "QF":(qfp, qf),
             "SF":(sfp, sf), "FINAL":(finalp, final)}
 
@@ -1424,10 +1577,13 @@ def render_filled_bracket(bracket_walk):
 def page_knockout_simulator(results: pd.DataFrame):
     st.title("🏆 Knockout Simulator")
     st.markdown(
-        "Monte-Carlo simulation of the Round of 32 bracket using **only "
-        "current 2026 tournament form** (goals scored / conceded per game so "
-        "far). Knockout suppression factor 0.92 applied; draws redistributed "
-        "to extra-time / penalty winners proportional to regulation win share."
+        "Monte-Carlo simulation of the Round of 32 bracket. Base signal is "
+        "**current 2026 tournament form** (goals scored / conceded per game). "
+        "Knockout suppression factor 0.92 applied; draws redistributed to "
+        "extra-time / penalty winners proportional to regulation win share. "
+        "Optionally blends in **Fox Sports per-process stats** (shots on goal, "
+        "chances created, possession, passing accuracy, tackles, interceptions, "
+        "fouls) to sharpen the favourite signal."
     )
 
     form = tournament_form_profile(results)
@@ -1447,25 +1603,57 @@ def page_knockout_simulator(results: pd.DataFrame):
     total_gf = sum(p["gf_per"] * p["games"] for p in form.values())
     tournament_avg = total_gf / max(games, 1)
 
+    # Fox Sports strengths (cached). If unavailable the toggle is a no-op.
+    strengths = build_team_strengths()
+    has_fox = bool(strengths)
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Tournament matches used", f"{games // 2}")
     c2.metric("Avg goals per team", f"{tournament_avg:.2f}")
     n_sims = c3.slider("Simulations", 1000, 50000, 20000, 1000)
 
+    # Fox Sports blend control
+    fcol1, fcol2 = st.columns([1, 2])
+    use_fox = fcol1.toggle(
+        "Blend in Fox Sports stats",
+        value=has_fox,
+        help="Fold per-process offensive & defensive z-scores into expected "
+             "goals. Sharpens favourite vs underdog gaps when group-stage "
+             "form is noisy (only 3 games per team).",
+        disabled=not has_fox,
+    )
+    fox_weight = fcol2.slider(
+        "Fox-stat weight",
+        min_value=0.0,
+        max_value=0.30,
+        value=0.18 if has_fox else 0.0,
+        step=0.02,
+        help="How strongly per-process stats tilt λ. 0 = pure form; 0.18 = "
+             "default; 0.30 = aggressive.",
+        disabled=not (has_fox and use_fox),
+    )
+    fw = fox_weight if (use_fox and has_fox) else 0.0
+    str_arg = strengths if (use_fox and has_fox) else None
+
     with st.spinner(f"Running {n_sims:,} simulations..."):
         probs = simulate_knockouts(
-            KNOCKOUT_BRACKET_R32, form, tournament_avg, n_sims=n_sims
+            KNOCKOUT_BRACKET_R32, form, tournament_avg, n_sims=n_sims,
+            strengths=str_arg, fox_weight=fw,
         )
 
     # --- Filled-in bracket image (deterministic walk: favourite advances) ---
     st.markdown("### 📖 Predicted bracket path")
-    st.caption(
+    cap = (
         "Below is the most-likely walk through the bracket: the favourite "
         "advances in every round, with each scoreline taken from the modal "
         "(most probable) score under the Poisson model. AET = decided in "
         "extra time / penalties."
     )
-    walk = walk_bracket(KNOCKOUT_BRACKET_R32, form, tournament_avg)
+    if fw > 0:
+        cap += f" Fox-stats blend ON (weight {fw:.2f})."
+    st.caption(cap)
+    walk = walk_bracket(KNOCKOUT_BRACKET_R32, form, tournament_avg,
+                        strengths=str_arg, fox_weight=fw)
     fig = render_filled_bracket(walk)
     if fig is not None:
         st.pyplot(fig, use_container_width=True)
@@ -1500,7 +1688,10 @@ def page_knockout_simulator(results: pd.DataFrame):
     # --- Round of 32 individual match predictions ---
     st.markdown("### 🎯 Round of 32 — match-by-match")
     for a, b in KNOCKOUT_BRACKET_R32:
-        p_a, p_b, lam_a, lam_b = knockout_win_prob(a, b, form, tournament_avg)
+        p_a, p_b, lam_a, lam_b = knockout_win_prob(
+            a, b, form, tournament_avg,
+            strengths=str_arg, fox_weight=fw,
+        )
         c1, c2 = st.columns([3, 1])
         with c1:
             prob_bar(p_a, 0.0, p_b, a, b)
@@ -1525,6 +1716,134 @@ def page_knockout_simulator(results: pd.DataFrame):
             })
     form_df = pd.DataFrame(form_rows).sort_values("GD / game", ascending=False)
     st.dataframe(form_df, use_container_width=True, hide_index=True)
+
+    # --- Fox Sports strengths table ---
+    if has_fox:
+        st.markdown("### 🧠 Fox Sports team strengths (z-scores)")
+        st.caption(
+            "Attack z combines shots on goal / chances created / possession / "
+            "passing accuracy (per game). Defence z combines tackles + "
+            "interceptions minus fouls (per game). Positive = better than "
+            "the 48-team average."
+        )
+        srows = []
+        for t in bracket_teams:
+            s = strengths.get(t)
+            if s:
+                srows.append({
+                    "Team": t,
+                    "Attack z": round(s["attack"], 2),
+                    "Defence z": round(s["defence"], 2),
+                    "Composite": round(s["attack"] + s["defence"], 2),
+                })
+        sdf = pd.DataFrame(srows).sort_values("Composite", ascending=False)
+        st.dataframe(
+            sdf.style.background_gradient(subset=["Attack z"], cmap="Reds")
+                     .background_gradient(subset=["Defence z"], cmap="Blues")
+                     .background_gradient(subset=["Composite"], cmap="Greens"),
+            use_container_width=True, hide_index=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Page: Team Stats — Fox Sports offensive & defensive
+# ---------------------------------------------------------------------------
+def page_team_stats():
+    st.title("📈 Team Stats — Offensive & Defensive")
+    st.caption(
+        "Per-process stats from Fox Sports for every nation that played "
+        "the 2026 World Cup group stage. Source: "
+        "foxsports.com/soccer/fifa-world-cup-men/team-stats"
+    )
+    fox = load_fox_stats()
+    if not fox:
+        st.error("`fox_sports_stats.json` not found in the app folder.")
+        return
+
+    # --- Offensive table ---
+    st.markdown("### ⚽ Offensive")
+    st.caption(
+        "GP = games played · S = shots · SOG = shots on goal · "
+        "CC = chances created · POSS = possession % · "
+        "PA = passing accuracy · CK = corner kicks · OFF = offsides."
+    )
+    off_rows = []
+    for s in fox:
+        o = s.get("offensive") or {}
+        off_rows.append({
+            "Team": s["team"],
+            "GP": o.get("GP"),
+            "S": o.get("S"),
+            "SOG": o.get("SOG"),
+            "CC": o.get("CC"),
+            "POSS %": o.get("POSS"),
+            "PA": o.get("PA"),
+            "CK": o.get("CK"),
+            "OFF": o.get("OFF"),
+        })
+    odf = pd.DataFrame(off_rows).sort_values("SOG", ascending=False)
+    st.dataframe(
+        odf.style.background_gradient(subset=["SOG", "CC"], cmap="Reds")
+                 .background_gradient(subset=["POSS %", "PA"], cmap="Blues"),
+        use_container_width=True, hide_index=True,
+    )
+
+    # --- Defensive table ---
+    st.markdown("### 🛡️ Defensive")
+    st.caption(
+        "TI = throw-ins won · INT = interceptions · TKL = tackles · "
+        "TA = tackles attempted · GK = goalkeeping actions · "
+        "F = fouls · FK = free kicks conceded · OG = own goals."
+    )
+    def_rows = []
+    for s in fox:
+        d = s.get("defensive") or {}
+        def_rows.append({
+            "Team": s["team"],
+            "GP": d.get("GP"),
+            "INT": d.get("INT"),
+            "TKL": d.get("TKL"),
+            "TA": d.get("TA"),
+            "GK": d.get("GK"),
+            "F": d.get("F"),
+            "FK": d.get("FK"),
+            "OG": d.get("OG"),
+        })
+    ddf = pd.DataFrame(def_rows)
+    # Show teams with no defensive data at the bottom
+    ddf["_sort"] = ddf["TKL"].apply(lambda x: -1 if x is None else x)
+    ddf = ddf.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+    st.dataframe(
+        ddf.style.background_gradient(subset=["INT", "TKL"], cmap="Blues"),
+        use_container_width=True, hide_index=True,
+    )
+    nulls = [r["Team"] for r in def_rows if r["TKL"] is None]
+    if nulls:
+        st.warning(
+            f"No defensive stats available from Fox Sports for: "
+            f"{', '.join(nulls)} — their defence z is set to 0 (neutral) in the model."
+        )
+
+    # --- Composite strengths ---
+    strengths = build_team_strengths(fox)
+    if strengths:
+        st.markdown("### 🧠 Composite strength scores (z-scores)")
+        st.caption(
+            "How the simulator turns these tables into a single attack and "
+            "defence number per team. Positive = better than the 48-team "
+            "average; negative = worse."
+        )
+        rows = [{"Team": t, "Attack z": round(s["attack"], 2),
+                 "Defence z": round(s["defence"], 2),
+                 "Composite": round(s["attack"] + s["defence"], 2)}
+                for t, s in strengths.items()]
+        cdf = pd.DataFrame(rows).sort_values("Composite", ascending=False)
+        st.dataframe(
+            cdf.style.background_gradient(subset=["Attack z"], cmap="Reds")
+                     .background_gradient(subset=["Defence z"], cmap="Blues")
+                     .background_gradient(subset=["Composite"], cmap="Greens"),
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1847,6 +2166,36 @@ strong qualifiers (Sweden, Germany, Canada, England) have backed it up.
 You can revert to the older settings via the sidebar sliders if you'd
 like to A/B test.
 
+### Knockout simulator — Fox Sports per-process blend
+
+The Knockout Simulator uses **2026 tournament form only** for its base λ
+(goals scored / conceded per game in the group stage), then optionally
+blends in **per-process stats from Fox Sports** to sharpen the signal
+when group form is noisy (only 3 games per team).
+
+**Source:** [foxsports.com / fifa-world-cup-men / team-stats](https://www.foxsports.com/soccer/fifa-world-cup-men/team-stats?category=offensive&season=2026&groupId=12)
+— see the new **📈 Team Stats** page for the raw tables.
+
+**Strength scores (z-scores over all 48 nations):**
+
+* **Attack z** = average z-score of shots-on-goal/game, chances-created/game,
+  possession %, and passing accuracy.
+* **Defence z** = average z-score of tackles/game, interceptions/game,
+  *minus* fouls/game (less reckless defending counts as better).
+
+**Blend into λ:**
+
+```
+m_A = (1 + w · attack_A) · (1 − w · defence_B)
+λ_A ← λ_A · clip(m_A, 0.55, 1.65)
+```
+
+where `w` is the Fox-stat weight slider on the Knockout Simulator page
+(default 0.18). The multiplier is clipped to [0.55, 1.65] so a single
+per-process advantage can never more than ~halve or double a team's xG.
+Teams with no defensive stats (Colombia, Japan, Cape Verde, Scotland,
+Uzbekistan) get a neutral defence z = 0.
+
 ### Limitations
 
 * Historical World Cup data only — domestic and continental form is ignored.
@@ -1854,6 +2203,8 @@ like to A/B test.
   2022 Brazil identically. A time-decay weight could be added.
 * Home-advantage is not modelled (2026 has three hosts).
 * Penalty shoot-outs and extra time are not modelled separately.
+* Fox Sports per-process stats are season-level snapshots (no per-match
+  granularity), so they cannot capture form trends within the tournament.
 """
     )
 
