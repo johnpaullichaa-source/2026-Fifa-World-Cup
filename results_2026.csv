@@ -55,22 +55,22 @@ match_no,home_team,away_team,home_score,away_score
 54,South Africa,Rep. of Korea,1,0
 55,Curaçao,Ivory Coast,0,2
 56,Ecuador,Germany,2,1
-57,Japan,Sweden,,
-58,Tunisia,Netherlands,,
-59,Turkey,USA,,
-60,Paraguay,Australia,,
-61,Norway,France,,
-62,Senegal,Iraq,,
-63,Egypt,IR Iran,,
-64,New Zealand,Belgium,,
-65,Cape Verde,Saudi Arabia,,
-66,Uruguay,Spain,,
-67,Panama,England,,
-68,Croatia,Ghana,,
-69,Algeria,Austria,,
-70,Jordan,Argentina,,
-71,Colombia,Portugal,,
-72,DR Congo,Uzbekistan,,
+57,Japan,Sweden,1,1
+58,Tunisia,Netherlands,1,3
+59,Turkey,USA,3,2
+60,Paraguay,Australia,0,0
+61,Norway,France,1,4
+62,Senegal,Iraq,5,0
+63,Egypt,IR Iran,1,1
+64,New Zealand,Belgium,1,5
+65,Cape Verde,Saudi Arabia,0,0
+66,Uruguay,Spain,0,1
+67,Panama,England,0,2
+68,Croatia,Ghana,2,1
+69,Algeria,Austria,3,3
+70,Jordan,Argentina,1,3
+71,Colombia,Portugal,0,0
+72,DR Congo,Uzbekistan,3,1
 73,,,,
 74,,,,
 75,,,,

@@ -759,7 +759,8 @@ def main() -> None:
     page = st.sidebar.radio(
         "Navigate",
         ["🏟️ Dashboard", "🔮 Match Predictor", "👥 Team Profiles",
-         "🥇 Tournament Simulator", "📡 Live Results", "📐 Methodology"],
+         "🥇 Tournament Simulator", "🏆 Knockout Simulator",
+         "📡 Live Results", "📐 Methodology"],
     )
 
     st.sidebar.divider()
@@ -828,6 +829,8 @@ def main() -> None:
         page_profiles(hist, stats, groups, qualifiers)
     elif page == "🥇 Tournament Simulator":
         page_simulator(hist, fixtures, groups, results, qual_in_use, qual_w)
+    elif page == "🏆 Knockout Simulator":
+        page_knockout_simulator(results)
     elif page == "📡 Live Results":
         page_live_results(base_hist, fixtures, results, qual_in_use, qual_w)
     else:
@@ -1087,6 +1090,263 @@ def _render_qualifier_section(team: str, qprof: dict):
         "team": "played as", "gf": "scored", "ga": "conceded",
     })
     st.dataframe(games, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Page: Knockout Simulator — Monte Carlo through the R32 bracket
+# ---------------------------------------------------------------------------
+
+# Bracket order from official 2026 bracket image (top to bottom on left side,
+# then top to bottom on right side). Each pair plays in the Round of 32.
+# Winners of adjacent pairs meet in the R16, and so on.
+KNOCKOUT_BRACKET_R32: list[tuple[str, str]] = [
+    # Left side
+    ("Germany", "Paraguay"),
+    ("France", "Sweden"),
+    ("South Africa", "Canada"),
+    ("Netherlands", "Morocco"),
+    ("Portugal", "Croatia"),
+    ("Spain", "Austria"),
+    ("USA", "Bosnia/Herzeg."),
+    ("Belgium", "Senegal"),
+    # Right side
+    ("Brazil", "Japan"),
+    ("Ivory Coast", "Norway"),
+    ("Mexico", "Ecuador"),
+    ("England", "DR Congo"),
+    ("Argentina", "Cape Verde"),
+    ("Australia", "Egypt"),
+    ("Switzerland", "Algeria"),
+    ("Colombia", "Ghana"),
+]
+
+
+def tournament_form_profile(results: pd.DataFrame) -> dict[str, dict]:
+    """Build attack/defense per team using ONLY the 2026 tournament so far.
+
+    Returns dict: team -> {games, gf_per, ga_per}
+    """
+    played = results.dropna(subset=["home_score", "away_score"]).copy()
+    if played.empty:
+        return {}
+    played["home_score"] = played["home_score"].astype(int)
+    played["away_score"] = played["away_score"].astype(int)
+    rows = []
+    for _, m in played.iterrows():
+        rows.append({"team": m["home_team"], "gf": m["home_score"], "ga": m["away_score"]})
+        rows.append({"team": m["away_team"], "gf": m["away_score"], "ga": m["home_score"]})
+    df = pd.DataFrame(rows)
+    profile: dict[str, dict] = {}
+    for team, sub in df.groupby("team"):
+        profile[team] = {
+            "games": int(len(sub)),
+            "gf_per": float(sub["gf"].mean()),
+            "ga_per": float(sub["ga"].mean()),
+        }
+    return profile
+
+
+def knockout_expected_goals(
+    team_a: str,
+    team_b: str,
+    form: dict[str, dict],
+    tournament_avg: float,
+) -> tuple[float, float]:
+    """Expected goals for a knockout match using ONLY 2026 tournament form.
+
+    λ_A = (A's goals-scored per game) × (B's goals-conceded per game) / tournament_avg
+    Knockout suppression: shrink λ by 8% (knockouts are cagier than groups).
+    """
+    KNOCKOUT_SUPPRESSION = 0.92
+    a = form.get(team_a, {"gf_per": tournament_avg, "ga_per": tournament_avg})
+    b = form.get(team_b, {"gf_per": tournament_avg, "ga_per": tournament_avg})
+    lam_a = max(0.15, a["gf_per"] * b["ga_per"] / max(tournament_avg, 0.1))
+    lam_b = max(0.15, b["gf_per"] * a["ga_per"] / max(tournament_avg, 0.1))
+    return lam_a * KNOCKOUT_SUPPRESSION, lam_b * KNOCKOUT_SUPPRESSION
+
+
+def knockout_win_prob(
+    team_a: str,
+    team_b: str,
+    form: dict[str, dict],
+    tournament_avg: float,
+) -> tuple[float, float, float, float]:
+    """P(A wins after ET/pens), P(B wins), expected goals λ_a, λ_b.
+
+    Knockouts have no draws — we redistribute the draw probability
+    proportionally to each team's regulation win probability (a
+    standard approximation for ET + penalty shootouts).
+    """
+    lam_a, lam_b = knockout_expected_goals(team_a, team_b, form, tournament_avg)
+    p_a, p_d, p_b, _ = match_probabilities(lam_a, lam_b)
+    if p_a + p_b < 1e-9:
+        return 0.5, 0.5, lam_a, lam_b
+    # Allocate the draw probability proportionally to each team's regulation win share
+    share_a = p_a / (p_a + p_b)
+    return p_a + p_d * share_a, p_b + p_d * (1 - share_a), lam_a, lam_b
+
+
+def simulate_knockouts(
+    bracket: list[tuple[str, str]],
+    form: dict[str, dict],
+    tournament_avg: float,
+    n_sims: int = 20000,
+    rng_seed: int = 42,
+) -> dict:
+    """Monte Carlo through R32 → R16 → QF → SF → Final.
+
+    Returns counts at each round + champion probabilities.
+    """
+    rng = np.random.default_rng(rng_seed)
+    teams = [t for pair in bracket for t in pair]
+    # Pre-compute pairwise win probabilities (cheap — 32 teams, sparse usage)
+    win_cache: dict[tuple[str, str], float] = {}
+
+    def p_win(a: str, b: str) -> float:
+        key = (a, b)
+        if key in win_cache:
+            return win_cache[key]
+        pa, _, _, _ = knockout_win_prob(a, b, form, tournament_avg)
+        win_cache[key] = pa
+        win_cache[(b, a)] = 1 - pa
+        return pa
+
+    counts = {
+        "R16":      {t: 0 for t in teams},
+        "QF":       {t: 0 for t in teams},
+        "SF":       {t: 0 for t in teams},
+        "Final":    {t: 0 for t in teams},
+        "Champion": {t: 0 for t in teams},
+    }
+
+    for _ in range(n_sims):
+        # Round of 32
+        r16_winners = []
+        for a, b in bracket:
+            w = a if rng.random() < p_win(a, b) else b
+            counts["R16"][w] += 1
+            r16_winners.append(w)
+        # Round of 16
+        qf_winners = []
+        for i in range(0, 16, 2):
+            a, b = r16_winners[i], r16_winners[i + 1]
+            w = a if rng.random() < p_win(a, b) else b
+            counts["QF"][w] += 1
+            qf_winners.append(w)
+        # Quarter-finals
+        sf_winners = []
+        for i in range(0, 8, 2):
+            a, b = qf_winners[i], qf_winners[i + 1]
+            w = a if rng.random() < p_win(a, b) else b
+            counts["SF"][w] += 1
+            sf_winners.append(w)
+        # Semi-finals
+        final_winners = []
+        for i in range(0, 4, 2):
+            a, b = sf_winners[i], sf_winners[i + 1]
+            w = a if rng.random() < p_win(a, b) else b
+            counts["Final"][w] += 1
+            final_winners.append(w)
+        # Final
+        a, b = final_winners
+        w = a if rng.random() < p_win(a, b) else b
+        counts["Champion"][w] += 1
+
+    # Convert to probabilities
+    probs = {round_name: {t: c / n_sims for t, c in cs.items()}
+             for round_name, cs in counts.items()}
+    return probs
+
+
+def page_knockout_simulator(results: pd.DataFrame):
+    st.title("🏆 Knockout Simulator")
+    st.markdown(
+        "Monte-Carlo simulation of the Round of 32 bracket using **only "
+        "current 2026 tournament form** (goals scored / conceded per game so "
+        "far). Knockout suppression factor 0.92 applied; draws redistributed "
+        "to extra-time / penalty winners proportional to regulation win share."
+    )
+
+    form = tournament_form_profile(results)
+    bracket_teams = [t for pair in KNOCKOUT_BRACKET_R32 for t in pair]
+    missing = [t for t in bracket_teams if t not in form]
+    if missing:
+        st.warning(
+            f"No 2026 form data for: {', '.join(missing)}. They'll be modelled "
+            "at the tournament average."
+        )
+    if not form:
+        st.error("No played 2026 matches found — upload results first.")
+        return
+
+    # Tournament average (goals per team per game)
+    games = sum(p["games"] for p in form.values())
+    total_gf = sum(p["gf_per"] * p["games"] for p in form.values())
+    tournament_avg = total_gf / max(games, 1)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Tournament matches used", f"{games // 2}")
+    c2.metric("Avg goals per team", f"{tournament_avg:.2f}")
+    n_sims = c3.slider("Simulations", 1000, 50000, 20000, 1000)
+
+    with st.spinner(f"Running {n_sims:,} simulations..."):
+        probs = simulate_knockouts(
+            KNOCKOUT_BRACKET_R32, form, tournament_avg, n_sims=n_sims
+        )
+
+    # --- Champion leaderboard ---
+    st.markdown("### 🥇 Championship probabilities")
+    champ_df = pd.DataFrame([
+        {
+            "Team": t,
+            "Win R32 %":  probs["R16"][t] * 100,
+            "Reach QF %": probs["QF"][t] * 100,
+            "Reach SF %": probs["SF"][t] * 100,
+            "Reach Final %": probs["Final"][t] * 100,
+            "Champion %": probs["Champion"][t] * 100,
+        }
+        for t in bracket_teams
+    ]).sort_values("Champion %", ascending=False).reset_index(drop=True)
+    st.dataframe(
+        champ_df.style.format({
+            "Win R32 %": "{:.1f}",
+            "Reach QF %": "{:.1f}",
+            "Reach SF %": "{:.1f}",
+            "Reach Final %": "{:.1f}",
+            "Champion %": "{:.1f}",
+        }).background_gradient(subset=["Champion %"], cmap="Blues"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # --- Round of 32 individual match predictions ---
+    st.markdown("### 🎯 Round of 32 — match-by-match")
+    for a, b in KNOCKOUT_BRACKET_R32:
+        p_a, p_b, lam_a, lam_b = knockout_win_prob(a, b, form, tournament_avg)
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            prob_bar(p_a, 0.0, p_b, a, b)
+            st.caption(f"Expected goals: {a} {lam_a:.2f} — {lam_b:.2f} {b}")
+        with c2:
+            fav = a if p_a > p_b else b
+            edge = abs(p_a - p_b) * 100
+            st.metric("Favourite", fav, f"+{edge:.1f}%")
+
+    # --- Form table ---
+    st.markdown("### 📊 Tournament form (the data driving the sim)")
+    form_rows = []
+    for t in bracket_teams:
+        if t in form:
+            p = form[t]
+            form_rows.append({
+                "Team": t,
+                "Games": p["games"],
+                "Goals For / game": round(p["gf_per"], 2),
+                "Goals Against / game": round(p["ga_per"], 2),
+                "GD / game": round(p["gf_per"] - p["ga_per"], 2),
+            })
+    form_df = pd.DataFrame(form_rows).sort_values("GD / game", ascending=False)
+    st.dataframe(form_df, use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
