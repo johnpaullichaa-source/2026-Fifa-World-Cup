@@ -40,11 +40,18 @@ FOX_WEIGHT = 0.18
 strengths = wc.build_team_strengths()
 print(f"Fox Sports strengths loaded for {len(strengths)} teams; weight={FOX_WEIGHT}")
 
+# FIFA World Ranking z-scores
+RANK_WEIGHT = 0.15
+fifa_ranks = wc.load_fifa_rankings()
+rank_z = wc.build_rank_strengths(fifa_ranks)
+print(f"FIFA rank z loaded for {len(rank_z)} teams; weight={RANK_WEIGHT}")
+
 def modal_score(team_a, team_b):
     """Return the most likely scoreline using the same xG model as the sim."""
     la, lb = wc.knockout_expected_goals(
         team_a, team_b, form, tavg,
         strengths=strengths, fox_weight=FOX_WEIGHT,
+        rank_z=rank_z, rank_weight=RANK_WEIGHT,
     )
     a = np.array([poisson.pmf(i, la) for i in range(8)])
     b = np.array([poisson.pmf(i, lb) for i in range(8)])
@@ -57,6 +64,7 @@ def resolve(team_a, team_b):
     pa, pb, la, lb = wc.knockout_win_prob(
         team_a, team_b, form, tavg,
         strengths=strengths, fox_weight=FOX_WEIGHT,
+        rank_z=rank_z, rank_weight=RANK_WEIGHT,
     )
     sa, sb, _, _ = modal_score(team_a, team_b)
     # Determine favourite first (single source of truth)
@@ -292,7 +300,7 @@ ax.text(MIDX, 0.35, f"Final: {final_pair[0]} {final_result[1]}–{final_result[2
         fontsize=13, color="#fef3c7", ha="center", va="center", zorder=5)
 ax.text(MIDX, 17.45, "World Cup 2026 — Predicted Knockout Bracket",
         fontsize=15, color="#e2e8f0", weight="bold", ha="center", va="center")
-ax.text(MIDX, 17.05, "2026 group-stage form + Fox Sports per-process stats blend",
+ax.text(MIDX, 17.05, "2026 form + Fox Sports stats + FIFA World Ranking blend",
         fontsize=10, color="#94a3b8", ha="center", va="center", style="italic")
 
 plt.tight_layout(pad=0)

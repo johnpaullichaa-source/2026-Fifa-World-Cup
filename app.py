@@ -1262,6 +1262,81 @@ def build_team_strengths(_fox: list[dict] | None = None) -> dict[str, dict[str, 
     return strengths
 
 
+# ---------------------------------------------------------------------------
+# FIFA World Ranking (inside.fifa.com/fifa-world-ranking/men)
+# ---------------------------------------------------------------------------
+FIFA_RANK_PATH = Path(__file__).resolve().parent / "fifa_world_ranking.json"
+
+# FIFA ranking name → canonical app name
+FIFA_ALIAS = {
+    "IR Iran": "Iran",
+    "Iran": "Iran",
+    "Korea Republic": "Korea Republic",
+    "Côte d'Ivoire": "Ivory Coast",
+    "Cote d'Ivoire": "Ivory Coast",
+    "Curaçao": "Curacao",
+    "Curacao": "Curacao",
+    "Czechia": "Czech Rep.",
+    "Türkiye": "Turkey",
+    "Cabo Verde": "Cape Verde",
+    "Cape Verde Islands": "Cape Verde",
+    "Bosnia and Herzegovina": "Bosnia/Herzeg.",
+    "Congo DR": "DR Congo",
+    "United States": "USA",
+    "Republic of Ireland": "Ireland",
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_fifa_rankings() -> dict[str, int]:
+    """Load FIFA Men's World Ranking. Returns dict canonical_team -> rank.
+
+    Source: https://inside.fifa.com/fifa-world-ranking/men.
+    """
+    if not FIFA_RANK_PATH.exists():
+        return {}
+    try:
+        data = json.loads(FIFA_RANK_PATH.read_text())
+    except Exception:
+        return {}
+    ranks: dict[str, int] = {}
+    for rec in data:
+        name = FIFA_ALIAS.get(rec["team"], rec["team"])
+        if rec.get("rank") is not None and name not in ranks:
+            ranks[name] = int(rec["rank"])
+    return ranks
+
+
+@st.cache_data(show_spinner=False)
+def build_rank_strengths(_ranks: dict[str, int] | None = None) -> dict[str, float]:
+    """Convert FIFA ranks into per-team z-scores.
+
+    We use the *log* of rank position (log(rank)), inverted so #1 is most
+    positive. Log spacing is appropriate because the gap between #1 and
+    #10 in real strength is much larger than between #100 and #109.
+    Then we z-score across the 32 bracket teams (so the spread is
+    meaningful inside this tournament).
+    """
+    ranks = _ranks if _ranks is not None else load_fifa_rankings()
+    if not ranks:
+        return {}
+    bracket_teams = [t for pair in KNOCKOUT_BRACKET_R32 for t in pair]
+    log_ranks = []
+    for t in bracket_teams:
+        r = ranks.get(t)
+        if r is None:
+            continue
+        log_ranks.append(-math.log(max(r, 1)))  # negate so #1 -> highest value
+    if not log_ranks:
+        return {}
+    arr = np.array(log_ranks, dtype=float)
+    mu, sd = float(arr.mean()), float(arr.std(ddof=0)) or 1.0
+    z: dict[str, float] = {}
+    for t, r in ranks.items():
+        z[t] = float((-math.log(max(r, 1)) - mu) / sd)
+    return z
+
+
 def knockout_expected_goals(
     team_a: str,
     team_b: str,
@@ -1269,6 +1344,8 @@ def knockout_expected_goals(
     tournament_avg: float,
     strengths: dict[str, dict[str, float]] | None = None,
     fox_weight: float = 0.0,
+    rank_z: dict[str, float] | None = None,
+    rank_weight: float = 0.0,
 ) -> tuple[float, float]:
     """Expected goals for a knockout match.
 
@@ -1297,6 +1374,18 @@ def knockout_expected_goals(
         lam_a *= m_a
         lam_b *= m_b
 
+    if rank_z and rank_weight > 0:
+        za = rank_z.get(team_a, 0.0)
+        zb = rank_z.get(team_b, 0.0)
+        rw = float(rank_weight)
+        # Differential boost: better-ranked team's λ goes up, worse-ranked's λ goes down.
+        # Symmetric around the rank-z gap. Clipped to [0.55, 1.65] like Fox.
+        gap = za - zb
+        m_a = max(0.55, min(1.65, 1 + rw * gap))
+        m_b = max(0.55, min(1.65, 1 - rw * gap))
+        lam_a *= m_a
+        lam_b *= m_b
+
     return lam_a * KNOCKOUT_SUPPRESSION, lam_b * KNOCKOUT_SUPPRESSION
 
 
@@ -1307,6 +1396,8 @@ def knockout_win_prob(
     tournament_avg: float,
     strengths: dict[str, dict[str, float]] | None = None,
     fox_weight: float = 0.0,
+    rank_z: dict[str, float] | None = None,
+    rank_weight: float = 0.0,
 ) -> tuple[float, float, float, float]:
     """P(A wins after ET/pens), P(B wins), expected goals λ_a, λ_b.
 
@@ -1317,6 +1408,7 @@ def knockout_win_prob(
     lam_a, lam_b = knockout_expected_goals(
         team_a, team_b, form, tournament_avg,
         strengths=strengths, fox_weight=fox_weight,
+        rank_z=rank_z, rank_weight=rank_weight,
     )
     p_a, p_d, p_b, _ = match_probabilities(lam_a, lam_b)
     if p_a + p_b < 1e-9:
@@ -1334,6 +1426,8 @@ def simulate_knockouts(
     rng_seed: int = 42,
     strengths: dict[str, dict[str, float]] | None = None,
     fox_weight: float = 0.0,
+    rank_z: dict[str, float] | None = None,
+    rank_weight: float = 0.0,
 ) -> dict:
     """Monte Carlo through R32 → R16 → QF → SF → Final.
 
@@ -1351,6 +1445,7 @@ def simulate_knockouts(
         pa, _, _, _ = knockout_win_prob(
             a, b, form, tournament_avg,
             strengths=strengths, fox_weight=fox_weight,
+            rank_z=rank_z, rank_weight=rank_weight,
         )
         win_cache[key] = pa
         win_cache[(b, a)] = 1 - pa
@@ -1404,13 +1499,15 @@ def simulate_knockouts(
 
 
 def _resolve_match(team_a, team_b, form, tournament_avg,
-                   strengths=None, fox_weight=0.0):
+                   strengths=None, fox_weight=0.0,
+                   rank_z=None, rank_weight=0.0):
     """Single-shot match resolution for the deterministic bracket walk.
     Returns (winner, score_a, score_b, et_flag).
     """
     pa, pb, la, lb = knockout_win_prob(
         team_a, team_b, form, tournament_avg,
         strengths=strengths, fox_weight=fox_weight,
+        rank_z=rank_z, rank_weight=rank_weight,
     )
     # Modal scoreline
     a = np.array([poisson.pmf(i, la * 1.0) for i in range(8)])
@@ -1437,11 +1534,13 @@ def _resolve_match(team_a, team_b, form, tournament_avg,
 
 
 def walk_bracket(bracket, form, tournament_avg,
-                 strengths=None, fox_weight=0.0):
+                 strengths=None, fox_weight=0.0,
+                 rank_z=None, rank_weight=0.0):
     """Resolve the entire knockout tree deterministically (favourite advances)."""
     def resolve(a, b):
         return _resolve_match(a, b, form, tournament_avg,
-                              strengths=strengths, fox_weight=fox_weight)
+                              strengths=strengths, fox_weight=fox_weight,
+                              rank_z=rank_z, rank_weight=rank_weight)
     r32 = [resolve(a, b) for a, b in bracket]
     r16p = [(r32[i][0], r32[i+1][0]) for i in range(0, 16, 2)]
     r16 = [resolve(a, b) for a, b in r16p]
@@ -1607,6 +1706,11 @@ def page_knockout_simulator(results: pd.DataFrame):
     strengths = build_team_strengths()
     has_fox = bool(strengths)
 
+    # FIFA World Ranking z-scores
+    fifa_ranks = load_fifa_rankings()
+    rank_z_all = build_rank_strengths(fifa_ranks)
+    has_rank = bool(rank_z_all)
+
     c1, c2, c3 = st.columns(3)
     c1.metric("Tournament matches used", f"{games // 2}")
     c2.metric("Avg goals per team", f"{tournament_avg:.2f}")
@@ -1635,10 +1739,35 @@ def page_knockout_simulator(results: pd.DataFrame):
     fw = fox_weight if (use_fox and has_fox) else 0.0
     str_arg = strengths if (use_fox and has_fox) else None
 
+    # FIFA ranking blend control
+    rcol1, rcol2 = st.columns([1, 2])
+    use_rank = rcol1.toggle(
+        "Blend in FIFA World Ranking",
+        value=has_rank,
+        help="Each team's FIFA rank is turned into a z-score (log-spaced, "
+             "so the jump from #1 to #10 matters more than #100 to #109). "
+             "The rank-z differential then nudges λ up for the higher-ranked "
+             "side, down for the lower-ranked side.",
+        disabled=not has_rank,
+    )
+    rank_weight = rcol2.slider(
+        "FIFA-rank weight",
+        min_value=0.0,
+        max_value=0.30,
+        value=0.15 if has_rank else 0.0,
+        step=0.02,
+        help="How strongly the FIFA-rank gap tilts λ. 0 = ignore ranking; "
+             "0.15 = default; 0.30 = aggressive.",
+        disabled=not (has_rank and use_rank),
+    )
+    rw = rank_weight if (use_rank and has_rank) else 0.0
+    rank_arg = rank_z_all if (use_rank and has_rank) else None
+
     with st.spinner(f"Running {n_sims:,} simulations..."):
         probs = simulate_knockouts(
             KNOCKOUT_BRACKET_R32, form, tournament_avg, n_sims=n_sims,
             strengths=str_arg, fox_weight=fw,
+            rank_z=rank_arg, rank_weight=rw,
         )
 
     # --- Filled-in bracket image (deterministic walk: favourite advances) ---
@@ -1649,11 +1778,17 @@ def page_knockout_simulator(results: pd.DataFrame):
         "(most probable) score under the Poisson model. AET = decided in "
         "extra time / penalties."
     )
+    extras = []
     if fw > 0:
-        cap += f" Fox-stats blend ON (weight {fw:.2f})."
+        extras.append(f"Fox-stats {fw:.2f}")
+    if rw > 0:
+        extras.append(f"FIFA-rank {rw:.2f}")
+    if extras:
+        cap += " Blends ON: " + ", ".join(extras) + "."
     st.caption(cap)
     walk = walk_bracket(KNOCKOUT_BRACKET_R32, form, tournament_avg,
-                        strengths=str_arg, fox_weight=fw)
+                        strengths=str_arg, fox_weight=fw,
+                        rank_z=rank_arg, rank_weight=rw)
     fig = render_filled_bracket(walk)
     if fig is not None:
         st.pyplot(fig, use_container_width=True)
@@ -1691,6 +1826,7 @@ def page_knockout_simulator(results: pd.DataFrame):
         p_a, p_b, lam_a, lam_b = knockout_win_prob(
             a, b, form, tournament_avg,
             strengths=str_arg, fox_weight=fw,
+            rank_z=rank_arg, rank_weight=rw,
         )
         c1, c2 = st.columns([3, 1])
         with c1:
@@ -1741,6 +1877,31 @@ def page_knockout_simulator(results: pd.DataFrame):
             sdf.style.background_gradient(subset=["Attack z"], cmap="Reds")
                      .background_gradient(subset=["Defence z"], cmap="Blues")
                      .background_gradient(subset=["Composite"], cmap="Greens"),
+            use_container_width=True, hide_index=True,
+        )
+
+    # --- FIFA World Ranking ---
+    if has_rank:
+        st.markdown("### 🏅 FIFA World Ranking — bracket teams")
+        st.caption(
+            "Live FIFA Men's World Ranking ([inside.fifa.com]"
+            "(https://inside.fifa.com/fifa-world-ranking/men)). Rank z is the "
+            "log-spaced z-score across the 32 bracket teams — positive = "
+            "better than the bracket average."
+        )
+        rrows = []
+        for t in bracket_teams:
+            r = fifa_ranks.get(t)
+            if r is None:
+                continue
+            rrows.append({
+                "Team": t,
+                "FIFA rank": r,
+                "Rank z": round(rank_z_all.get(t, 0.0), 2),
+            })
+        rdf = pd.DataFrame(rrows).sort_values("FIFA rank")
+        st.dataframe(
+            rdf.style.background_gradient(subset=["Rank z"], cmap="Greens"),
             use_container_width=True, hide_index=True,
         )
 
@@ -2195,6 +2356,36 @@ where `w` is the Fox-stat weight slider on the Knockout Simulator page
 per-process advantage can never more than ~halve or double a team's xG.
 Teams with no defensive stats (Colombia, Japan, Cape Verde, Scotland,
 Uzbekistan) get a neutral defence z = 0.
+
+### Knockout simulator — FIFA World Ranking blend
+
+A third optional blend uses the live **FIFA Men's World Ranking**.
+
+**Source:** [inside.fifa.com/fifa-world-ranking/men](https://inside.fifa.com/fifa-world-ranking/men).
+
+Each team's rank is mapped to a strength via
+
+```
+rank_strength = −log(rank)
+```
+
+Then we z-score across the 32 bracket teams (so #1 sits well above the
+bracket average and a #60 sits well below). Log spacing matters: the
+gap from #1 to #10 is much bigger in real strength than the gap from
+#100 to #109, even though both span 9 places.
+
+The rank-z **differential** then tilts λ:
+
+```
+gap   = rank_z_A − rank_z_B
+m_A   = clip(1 + w · gap, 0.55, 1.65)
+m_B   = clip(1 − w · gap, 0.55, 1.65)
+λ_A ← λ_A · m_A,   λ_B ← λ_B · m_B
+```
+
+where `w` is the FIFA-rank weight slider (default 0.15). Like the Fox
+blend the multiplier is clipped to [0.55, 1.65]. All three signals
+(form + Fox + FIFA-rank) can be toggled and re-weighted independently.
 
 ### Limitations
 
