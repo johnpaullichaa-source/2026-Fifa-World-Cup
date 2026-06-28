@@ -41,7 +41,7 @@ strengths = wc.build_team_strengths()
 print(f"Fox Sports strengths loaded for {len(strengths)} teams; weight={FOX_WEIGHT}")
 
 # FIFA World Ranking z-scores
-RANK_WEIGHT = 0.15
+RANK_WEIGHT = 0.30
 fifa_ranks = wc.load_fifa_rankings()
 rank_z = wc.build_rank_strengths(fifa_ranks)
 print(f"FIFA rank z loaded for {len(rank_z)} teams; weight={RANK_WEIGHT}")
