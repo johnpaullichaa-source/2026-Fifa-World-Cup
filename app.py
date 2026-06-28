@@ -1258,6 +1258,169 @@ def simulate_knockouts(
     return probs
 
 
+def _resolve_match(team_a, team_b, form, tournament_avg):
+    """Single-shot match resolution for the deterministic bracket walk.
+    Returns (winner, score_a, score_b, et_flag).
+    """
+    pa, pb, la, lb = knockout_win_prob(team_a, team_b, form, tournament_avg)
+    # Modal scoreline
+    a = np.array([poisson.pmf(i, la * 1.0) for i in range(8)])
+    b = np.array([poisson.pmf(i, lb * 1.0) for i in range(8)])
+    grid = np.outer(a, b)
+    sa, sb = np.unravel_index(np.argmax(grid), grid.shape)
+    sa, sb = int(sa), int(sb)
+    # Tiebreaker on probability ties: better GD/game
+    if abs(pa - pb) < 1e-6:
+        ga = form.get(team_a, {"gf_per":0,"ga_per":0})
+        gb = form.get(team_b, {"gf_per":0,"ga_per":0})
+        a_fav = (ga["gf_per"] - ga["ga_per"]) >= (gb["gf_per"] - gb["ga_per"])
+    else:
+        a_fav = pa > pb
+    et = False
+    if sa == sb:
+        et = True
+        if a_fav: sa += 1
+        else:     sb += 1
+    elif (sa > sb) != a_fav:
+        sa, sb = sb, sa
+    winner = team_a if a_fav else team_b
+    return winner, sa, sb, et
+
+
+def walk_bracket(bracket, form, tournament_avg):
+    """Resolve the entire knockout tree deterministically (favourite advances)."""
+    r32 = [_resolve_match(a, b, form, tournament_avg) for a, b in bracket]
+    r16p = [(r32[i][0], r32[i+1][0]) for i in range(0, 16, 2)]
+    r16 = [_resolve_match(a, b, form, tournament_avg) for a, b in r16p]
+    qfp  = [(r16[i][0], r16[i+1][0]) for i in range(0, 8, 2)]
+    qf  = [_resolve_match(a, b, form, tournament_avg) for a, b in qfp]
+    sfp  = [(qf[i][0], qf[i+1][0]) for i in range(0, 4, 2)]
+    sf  = [_resolve_match(a, b, form, tournament_avg) for a, b in sfp]
+    finalp = (sf[0][0], sf[1][0])
+    final = _resolve_match(*finalp, form, tournament_avg)
+    return {"R32":(bracket, r32), "R16":(r16p, r16), "QF":(qfp, qf),
+            "SF":(sfp, sf), "FINAL":(finalp, final)}
+
+
+def render_filled_bracket(bracket_walk):
+    """Build the filled-in bracket image and return the matplotlib Figure."""
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import FancyBboxPatch
+    except ImportError:
+        return None
+    fig, ax = plt.subplots(figsize=(26, 12))
+    fig.patch.set_facecolor("#0d1117")
+    ax.set_facecolor("#0d1117")
+    ax.set_xlim(0, 30); ax.set_ylim(0, 18); ax.axis("off")
+    BOX_BG, BOX_BG_WIN = "#1f6b6e", "#2dd4bf"
+    BOX_BG_CHAMP = "#fbbf24"
+    TEXT_LIGHT, TEXT_DARK, LINE = "#0d1117", "#f0f9ff", "#2dd4bf"
+    W, H = 2.6, 0.55
+
+    def box(x, y, ta, tb, sa, sb, w, et=False):
+        for k, (t, s, win) in enumerate([(ta, sa, w==ta), (tb, sb, w==tb)]):
+            bg = BOX_BG_WIN if win else BOX_BG
+            fg = TEXT_LIGHT if win else TEXT_DARK
+            r = FancyBboxPatch((x, y - k*H - H/2), W, H*0.9,
+                               boxstyle="round,pad=0.02,rounding_size=0.08",
+                               linewidth=0, facecolor=bg, zorder=2)
+            ax.add_patch(r)
+            ax.text(x + 0.12, y - k*H - H/2 + H*0.45, t,
+                    fontsize=8.5, color=fg, weight="bold", ha="left", va="center", zorder=3)
+            ax.text(x + W - 0.15, y - k*H - H/2 + H*0.45, str(s),
+                    fontsize=10, color=fg, weight="bold", ha="right", va="center", zorder=3)
+        if et:
+            ax.text(x + W/2, y - H - H/2 - 0.15, "AET",
+                    fontsize=6, color="#fcd34d", ha="center", va="top", zorder=3)
+
+    def conn(x1, y1, x2, y2):
+        mid = (x1+x2)/2
+        ax.plot([x1, mid, mid, x2], [y1, y1, y2, y2],
+                color=LINE, linewidth=1.2, zorder=1, alpha=0.7)
+
+    LEFT_X  = [0.3, 3.4, 6.5, 9.6]
+    RIGHT_X = [27.1, 24.0, 20.9, 17.8]
+
+    def ycen(n, total=15.0, top=17.0):
+        if n == 1: return [top - total/2]
+        step = total/(n-1)
+        return [top - i*step for i in range(n)]
+    left_r32 = ycen(8); right_r32 = ycen(8)
+    def nxt(ys): return [(ys[i]+ys[i+1])/2 for i in range(0,len(ys),2)]
+    left_r16, left_qf, left_sf = nxt(left_r32), None, None
+    left_qf = nxt(left_r16); left_sf = nxt(left_qf)
+    right_r16 = nxt(right_r32); right_qf = nxt(right_r16); right_sf = nxt(right_qf)
+    final_y = (left_sf[0] + right_sf[0])/2
+    final_x = (LEFT_X[3] + W + RIGHT_X[3])/2 - W/2
+
+    r32_pairs, r32_res = bracket_walk["R32"]
+    r16_pairs, r16_res = bracket_walk["R16"]
+    qf_pairs,  qf_res  = bracket_walk["QF"]
+    sf_pairs,  sf_res  = bracket_walk["SF"]
+    fpair, fres = bracket_walk["FINAL"]
+
+    for k,((a,b),(w,sa,sb,et)) in enumerate(zip(r32_pairs[:8], r32_res[:8])):
+        box(LEFT_X[0], left_r32[k], a, b, sa, sb, w, et)
+    for k,((a,b),(w,sa,sb,et)) in enumerate(zip(r32_pairs[8:], r32_res[8:])):
+        box(RIGHT_X[0], right_r32[k], a, b, sa, sb, w, et)
+    for k,((a,b),(w,sa,sb,et)) in enumerate(zip(r16_pairs[:4], r16_res[:4])):
+        box(LEFT_X[1], left_r16[k], a, b, sa, sb, w, et)
+    for k,((a,b),(w,sa,sb,et)) in enumerate(zip(qf_pairs[:2], qf_res[:2])):
+        box(LEFT_X[2], left_qf[k], a, b, sa, sb, w, et)
+    (a,b),(w,sa,sb,et) = sf_pairs[0], sf_res[0]
+    box(LEFT_X[3], left_sf[0], a, b, sa, sb, w, et)
+    for k,((a,b),(w,sa,sb,et)) in enumerate(zip(r16_pairs[4:], r16_res[4:])):
+        box(RIGHT_X[1], right_r16[k], a, b, sa, sb, w, et)
+    for k,((a,b),(w,sa,sb,et)) in enumerate(zip(qf_pairs[2:], qf_res[2:])):
+        box(RIGHT_X[2], right_qf[k], a, b, sa, sb, w, et)
+    (a,b),(w,sa,sb,et) = sf_pairs[1], sf_res[1]
+    box(RIGHT_X[3], right_sf[0], a, b, sa, sb, w, et)
+    (a,b),(w,sa,sb,et) = fpair, fres
+    box(final_x, final_y, a, b, sa, sb, w, et)
+
+    def cpair(xf, yf, xt, yt):
+        for i in range(0,len(yf),2):
+            x1 = xf + W; y1 = (yf[i] - H/2 + H*0.45 + yf[i] - H - H/2 + H*0.45)/2
+            y2 = (yt[i//2] - H/2 + H*0.45 + yt[i//2] - H - H/2 + H*0.45)/2
+            conn(x1, y1, xt, y2)
+    def cpair_r(xf, yf, xt, yt):
+        for i in range(0,len(yf),2):
+            x1 = xf; y1 = (yf[i] - H/2 + H*0.45 + yf[i] - H - H/2 + H*0.45)/2
+            y2 = (yt[i//2] - H/2 + H*0.45 + yt[i//2] - H - H/2 + H*0.45)/2
+            conn(x1, y1, xt + W, y2)
+    cpair(LEFT_X[0], left_r32, LEFT_X[1], left_r16)
+    cpair(LEFT_X[1], left_r16, LEFT_X[2], left_qf)
+    cpair(LEFT_X[2], left_qf, LEFT_X[3], left_sf)
+    cpair_r(RIGHT_X[0], right_r32, RIGHT_X[1], right_r16)
+    cpair_r(RIGHT_X[1], right_r16, RIGHT_X[2], right_qf)
+    cpair_r(RIGHT_X[2], right_qf, RIGHT_X[3], right_sf)
+    # SF -> Final
+    conn(LEFT_X[3]+W, left_sf[0]-H*0.55, final_x, final_y-H*0.55)
+    conn(RIGHT_X[3], right_sf[0]-H*0.55, final_x+W, final_y-H*0.55)
+
+    labels = ["R32","R16","QF","SF","FINAL","SF","QF","R16","R32"]
+    xs = [LEFT_X[0]+W/2, LEFT_X[1]+W/2, LEFT_X[2]+W/2, LEFT_X[3]+W/2,
+          final_x+W/2,
+          RIGHT_X[3]+W/2, RIGHT_X[2]+W/2, RIGHT_X[1]+W/2, RIGHT_X[0]+W/2]
+    for lab, x in zip(labels, xs):
+        ax.text(x, 17.7, lab, fontsize=11, color="#94a3b8", weight="bold", ha="center")
+
+    champion = fres[0]
+    MIDX = 15.0
+    ax.text(MIDX, 17.45, "World Cup 2026 — Predicted Knockout Bracket",
+            fontsize=15, color="#e2e8f0", weight="bold", ha="center")
+    ax.text(MIDX, 17.05, "Based on 2026 tournament form only (group stage data)",
+            fontsize=10, color="#94a3b8", ha="center", style="italic")
+    ax.text(MIDX, 1.0, f"CHAMPION: {champion.upper()}",
+            fontsize=26, color=BOX_BG_CHAMP, weight="bold", ha="center")
+    ax.text(MIDX, 0.35, f"Final: {fpair[0]} {fres[1]}–{fres[2]} {fpair[1]}" +
+            (" (AET)" if fres[3] else ""),
+            fontsize=13, color="#fef3c7", ha="center")
+    plt.tight_layout(pad=0)
+    return fig
+
+
 def page_knockout_simulator(results: pd.DataFrame):
     st.title("🏆 Knockout Simulator")
     st.markdown(
@@ -1293,6 +1456,21 @@ def page_knockout_simulator(results: pd.DataFrame):
         probs = simulate_knockouts(
             KNOCKOUT_BRACKET_R32, form, tournament_avg, n_sims=n_sims
         )
+
+    # --- Filled-in bracket image (deterministic walk: favourite advances) ---
+    st.markdown("### 📖 Predicted bracket path")
+    st.caption(
+        "Below is the most-likely walk through the bracket: the favourite "
+        "advances in every round, with each scoreline taken from the modal "
+        "(most probable) score under the Poisson model. AET = decided in "
+        "extra time / penalties."
+    )
+    walk = walk_bracket(KNOCKOUT_BRACKET_R32, form, tournament_avg)
+    fig = render_filled_bracket(walk)
+    if fig is not None:
+        st.pyplot(fig, use_container_width=True)
+    else:
+        st.warning("matplotlib unavailable — install matplotlib>=3.7 to see the bracket.")
 
     # --- Champion leaderboard ---
     st.markdown("### 🥇 Championship probabilities")
